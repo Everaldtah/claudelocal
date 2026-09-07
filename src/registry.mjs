@@ -20,10 +20,21 @@ import path from "node:path";
 import { readGGUF, archInfo } from "./gguf.mjs";
 import { paths, readJSON, GiB, MiB } from "./sys.mjs";
 
-// Claude Code's own system prompt is around 21k tokens before the conversation starts, so a model
-// whose native window is smaller than this cannot hold a single turn. Such models are still listed
-// by `claudelocal models`, with the reason, but they are kept out of the /model picker.
-export const MIN_CTX = 16384;
+// What Claude Code sends before the conversation has started at all: system prompt, tool
+// definitions, environment block. MEASURED on this machine at 33,096-33,522 tokens across several
+// sessions - not the ~21k the prompt alone accounts for.
+//
+// This number is the whole reason a 32768-token model cannot run Claude Code. It is not that such a
+// model runs out quickly; it is that the FIRST message already exceeds its window, and auto-compact
+// cannot help because there is no conversation to compact yet. The failure is an immediate
+//   request (33096 tokens) exceeds the available context size (32768 tokens)
+export const CLAUDE_CODE_BASE_TOKENS = 33522;
+
+// The smallest native window a model may have and still be offered in the picker: the baseline plus
+// roughly as much again for actual work. Anything below this is listed by `claudelocal models` with
+// the reason, and kept out of the picker - both because it cannot work, and because a model in the
+// picker drags the whole session's context window down to its own size.
+export const MIN_CTX = 65536;
 
 // The alias reserved for "whatever is loaded right now". Claude Code fires small side-requests
 // (conversation titles, file summaries) at the Haiku-class model while the main conversation runs
@@ -238,7 +249,10 @@ export function discover({ refresh = false, minCtx = MIN_CTX } = {}) {
       continue;
     }
     if (info.nCtxTrain < minCtx) {
-      skipped.push({ ...c, ...info, reason: `native context ${info.nCtxTrain} is below the ${minCtx} Claude Code needs` });
+      const why = info.nCtxTrain < CLAUDE_CODE_BASE_TOKENS
+        ? `native context ${info.nCtxTrain} cannot hold Claude Code's ${CLAUDE_CODE_BASE_TOKENS}-token opening prompt`
+        : `native context ${info.nCtxTrain} is below the ${minCtx} floor (--min-ctx to lower it)`;
+      skipped.push({ ...c, ...info, reason: why });
       continue;
     }
     if (!info.chatTemplate) {

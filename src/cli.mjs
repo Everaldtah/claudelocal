@@ -7,7 +7,7 @@ import { paths, ram, cpu, gpu, diskFree, fmtGB, GiB, readState, writeState, http
 import { inspect, plan, explain, ladder, serverArgs } from "./plan.mjs";
 import { up, down, health, findModel, findMmproj, serverExe, guardStatus, tailLog, DEFAULT_PORT, DEFAULT_PROXY_PORT } from "./serve.mjs";
 import { PROXY_VERSION } from "./proxy.mjs";
-import { discover, resolve as resolveModel, pickerRows, human, AUTO_ALIAS, MIN_CTX } from "./registry.mjs";
+import { discover, resolve as resolveModel, pickerRows, human, AUTO_ALIAS, MIN_CTX, CLAUDE_CODE_BASE_TOKENS } from "./registry.mjs";
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] ?? "help";
@@ -44,7 +44,19 @@ function bootModel(models) {
 function sessionCtx(models) {
   const cap = num("ctx", 0);
   const per = models.map((m) => (cap ? Math.min(cap, m.nCtxTrain) : m.nCtxTrain));
-  return per.length ? Math.min(...per) : (cap || 32768);
+  return per.length ? Math.min(...per) : (cap || MIN_CTX);
+}
+
+// A window that cannot hold Claude Code's opening prompt does not degrade gracefully - the very
+// first message comes back as a 400 and nothing works at all. Say so up front rather than letting
+// it be discovered one turn in.
+function warnIfTooSmall(ctx) {
+  if (ctx > CLAUDE_CODE_BASE_TOKENS) return;
+  say();
+  say(`WARNING  the session context is ${ctx} tokens, and Claude Code's opening prompt alone is`);
+  say(`         about ${CLAUDE_CODE_BASE_TOKENS}. The first message will fail with "exceeds the available`);
+  say("         context size\". Raise --ctx, or --min-ctx to drop the model pinning it.");
+  say();
 }
 
 const planOpts = () => ({
@@ -147,6 +159,7 @@ async function cmdUp() {
   if (!models.length) die(`no usable local models found\n  run: claudelocal pull   (or install one in LM Studio / ollama)`);
   const boot = bootModel(models);
   const ctx = sessionCtx(models);
+  warnIfTooSmall(ctx);
 
   say(`[claudelocal] starting ${boot.alias} (${boot.name}, ${human(boot.bytes)}, ${boot.source}) ...`);
   const r = await up({
@@ -202,14 +215,17 @@ async function cmdModels() {
     say(`${mark} ${m.alias.padEnd(28)} ${human(m.bytes).padStart(8)} ${String(Math.min(ctx, m.nCtxTrain)).padStart(7)} ${m.arch.padEnd(11)} ${(m.mmproj ? "yes" : "-").padEnd(7)} ${m.source}`);
   }
   say();
-  say(`  session context ${ctx} - the smallest native window in this list, because Claude Code's`);
-  say("  auto-compact threshold is fixed at startup and every model has to be able to hold it.");
+  say(`  session context ${ctx} - the smallest native window in this list. Every model in the picker`);
+  say("  shares one window, because Claude Code fixes its context limit at startup while the model");
+  say(`  behind it can change at any moment. Claude Code's opening prompt is ~${CLAUDE_CODE_BASE_TOKENS} tokens of it.`);
   if (models.length) {
     const smallest = models.reduce((a, b) => (a.nCtxTrain <= b.nCtxTrain ? a : b));
     if (smallest.nCtxTrain === ctx && models.some((m) => m.nCtxTrain > ctx)) {
-      say(`  ${smallest.alias} is what pins it. '--min-ctx ${ctx * 2}' drops it and the models like it.`);
+      const next = Math.min(...models.filter((m) => m.nCtxTrain > ctx).map((m) => m.nCtxTrain));
+      say(`  ${smallest.alias} pins it. '--min-ctx ${ctx + 1}' drops it and the rest share ${next}.`);
     }
   }
+  warnIfTooSmall(ctx);
   if (skipped.length) {
     say();
     say("Not offered:");

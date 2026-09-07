@@ -39,7 +39,7 @@ const CTX_CAP = parseInt(opt("ctx", process.env.CLAUDELOCAL_CTX || "0"), 10);
 const LOG = path.join(path.dirname(path.dirname(fileURLToPath(import.meta.url))), "logs", "proxy.log");
 
 // Bump when the rewriting rules change: `claudelocal up` replaces a proxy reporting an older one.
-export const PROXY_VERSION = 5;
+export const PROXY_VERSION = 6;
 
 // The registry is read from models.json, so this is cheap; it is re-read when a request names a
 // model we do not recognise, which is how a model downloaded mid-session becomes switchable
@@ -107,6 +107,36 @@ function normalize(body) {
   // is an hour of silence, so it is clamped to something a local model can actually finish.
   if (typeof body.max_tokens === "number" && body.max_tokens > MAX_OUTPUT) body.max_tokens = MAX_OUTPUT;
   return body;
+}
+
+// llama-server's context-overflow error is accurate and completely unactionable from inside Claude
+// Code: it names two numbers and tells you to "try increasing it", with no hint that the thing to
+// increase lives in a launcher flag, or that the window is small because of some OTHER model in the
+// picker rather than the one you are talking to. Rewrite it into the fix.
+function explainContextOverflow(text) {
+  let err;
+  try { err = JSON.parse(text); } catch { return text; }
+  const e = err?.error ?? {};
+  if (e.type !== "exceed_context_size_error") return text;
+  const nCtx = e.n_ctx ?? 0;
+  const need = e.n_prompt_tokens ?? 0;
+  const st = readState();
+  const model = registry.models.find((m) => m.file === st.model);
+  const native = model?.nCtxTrain ?? 0;
+
+  const lines = [`claudelocal: this turn needs ${need} tokens but ${st.alias ?? "the model"} is loaded with a ${nCtx}-token window.`];
+  if (native > nCtx) {
+    // The common case, and the one worth spelling out: the loaded model is perfectly capable and
+    // has been held down to the smallest window in the picker.
+    lines.push(`${st.alias} natively supports ${native}, but every model in the /model picker shares one window`);
+    lines.push(`and the smallest one sets it. Restart with:  claudelocal --cl-min-ctx ${nCtx + 1}`);
+    lines.push("('claudelocal --cl-models' names the model that is pinning it.)");
+  } else {
+    lines.push(`${nCtx} is this model's own maximum, so it cannot hold this conversation. Switch to a`);
+    lines.push("larger-context model with /model, or start a new conversation.");
+  }
+  e.message = lines.join(" ");
+  return JSON.stringify(err);
 }
 
 const server = http.createServer((req, res) => {
@@ -253,8 +283,9 @@ const server = http.createServer((req, res) => {
           const errChunks = [];
           r.on("data", (c) => errChunks.push(c));
           r.on("end", () => {
-            const text = Buffer.concat(errChunks).toString("utf8");
+            let text = Buffer.concat(errChunks).toString("utf8");
             log(`upstream ${r.statusCode} on ${url}: ${text.slice(0, 2000)}`);
+            text = explainContextOverflow(text);
             // If the ping timer already committed us to a 200 stream there is no status code left
             // to send, so deliver the failure the only way an open SSE stream can.
             if (res.headersSent) {
@@ -262,7 +293,13 @@ const server = http.createServer((req, res) => {
               res.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: `claudelocal: llama-server ${r.statusCode}: ${text.slice(0, 500)}` } })}\n\n`);
               return res.end();
             }
-            res.writeHead(r.statusCode ?? 502, r.headers);
+            // The rewritten message is longer than what llama-server sent, so its content-length
+            // header would truncate the body mid-JSON and the client would report a parse error
+            // instead of the explanation.
+            const outHeaders = { ...r.headers };
+            delete outHeaders["content-length"];
+            outHeaders["content-length"] = String(Buffer.byteLength(text, "utf8"));
+            res.writeHead(r.statusCode ?? 502, outHeaders);
             res.end(text);
           });
           return;

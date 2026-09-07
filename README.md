@@ -31,29 +31,31 @@ All three are plain GGUF files that `llama-server` can open directly, so nothing
 copied. claudelocal finds them, gives each one a short stable alias, works out a memory plan for it
 from its own tensor table, and puts the whole list into Claude Code's `/model` picker.
 
-On this machine that is **17 models across three managers**, from 352 MB to 19.7 GB:
+On this machine that is **12 usable models across three managers**, from 774 MB to 19.7 GB (five more
+are found and rejected, with the reason):
 
 ```
 $ claudelocal --cl-models
 
-17 local models  (source: claudelocal/models, LM Studio, ollama)
+12 local models  (source: claudelocal/models, LM Studio, ollama)
 
             alias                       size     ctx    arch        vision  where
-     qwen3.5-35b-a3b               19.7 GB   32768 qwen35moe   yes     lmstudio
-     glm-4.7-flash-heretic         16.2 GB   32768 deepseek2   -       lmstudio
-  -> qwen3.8-27b                   15.3 GB   32768 qwen35      yes     claudelocal
-     gpt-oss-20b                   11.3 GB   32768 gpt-oss     -       lmstudio
-     gemma-4-12b-it-heretic         6.9 GB   32768 gemma4      -       ollama
+     qwen3.5-35b-a3b               19.7 GB  128000 qwen35moe   yes     lmstudio
+     glm-4.7-flash-heretic         16.2 GB  128000 deepseek2   -       lmstudio
+  -> qwen3.8-27b                   15.3 GB  128000 qwen35      yes     claudelocal
+     gpt-oss-20b                   11.3 GB  128000 gpt-oss     -       lmstudio
+     gemma-4-12b-it-heretic         6.9 GB  128000 gemma4      -       ollama
      ...
 
-  session context 32768 - the smallest native window in this list, because Claude Code's
-  auto-compact threshold is fixed at startup and every model has to be able to hold it.
-  qwen2.5-coder-7b is what pins it. '--min-ctx 65536' drops it and the models like it.
+  session context 128000 - the smallest native window in this list. Every model in the picker
+  shares one window, because Claude Code fixes its context limit at startup while the model
+  behind it can change at any moment. Claude Code's opening prompt is ~33522 tokens of it.
+  lfm2.5-1.2b pins it. '--min-ctx 128001' drops it and the rest share 131072.
 
 Not offered:
-  Qwen2.5-0.5B-Instruct-Q4_K_M.gguf     incomplete download (40 MB of 379 MB)
-  nomic-embed-text                      native context 2048 is below the 16384 Claude Code needs
-  moondream                             native context 2048 is below the 16384 Claude Code needs
+  Qwen2.5-0.5B-Instruct-Q4_K_M.gguf   incomplete download (40 MB of 379 MB)
+  qwen2.5-coder:7b                    native context 32768 cannot hold Claude Code's 33522-token opening prompt
+  nomic-embed-text                    native context 2048 cannot hold Claude Code's 33522-token opening prompt
 ```
 
 The `ctx` column is the *shared* window every model in the picker has to agree on, not each model's
@@ -129,15 +131,31 @@ any moment. A window larger than some model's native context means that model is
 conversation it cannot hold. So the session is pinned to the **smallest** context in the picker, and
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is set to match.
 
-With every model on this machine offered, two 32k Qwen2.5 models pin the whole session to 32768.
-Narrowing the picker buys it straight back:
+This is also why a model needs a **native window of at least 65536** to be offered at all. Claude
+Code's opening prompt - system prompt, tool definitions, environment block - is **~33,500 tokens
+before you have typed anything**, measured on this machine. A 32768-token model therefore fails on
+the *first* message, and auto-compact cannot rescue it because there is no conversation to compact
+yet:
 
 ```
-claudelocal --cl-min-ctx 131072     11 models, 128k shared window
-claudelocal --cl-min-ctx 262144      5 models, 256k shared window
+API Error: 400 request (33096 tokens) exceeds the available context size (32768 tokens)
 ```
 
-`claudelocal --cl-models` always prints which model is pinning it, and what to pass to drop it.
+Worse, such a model dragged every *other* model down to 32768 with it just by being in the picker.
+So models that cannot hold the opening prompt are kept out by default, and the four 32k Qwen2.5
+models here are listed under "Not offered" with that reason.
+
+The remaining 12 share 128000. Narrowing further trades models for window:
+
+```
+claudelocal --cl-min-ctx 128001     11 models, 131072 shared window
+claudelocal --cl-min-ctx 262144      5 models, 262144 shared window
+```
+
+`claudelocal --cl-models` always prints which model is pinning the window and what to pass to drop
+it, and warns before starting if the window cannot hold the opening prompt. If a turn overflows
+anyway, the proxy rewrites llama-server's error into the flag that fixes it rather than passing on
+"try increasing it".
 
 ## The memory plan
 
@@ -149,24 +167,23 @@ accounting along the line that actually matters on Windows:
 - **soft budget** — mmap'd weights. Overrunning this only means pages get re-read from disk: slower
   per token, never a freeze. It is a warning, not a refusal.
 
-Every model on this machine, planned on an idle desktop (24.2 GB RAM free, 5.5 GB VRAM free):
+Every model in the picker, planned on an idle desktop (23.4 GB RAM free, 5.5 GB VRAM free) at the
+shared 128000-token window:
 
-| model | arch | on disk | ctx | KV | GPU layers | committed RAM |
+| model | arch | on disk | KV | KV size | GPU layers | committed RAM |
 |---|---|---|---|---|---|---|
-| `qwen3.5-35b-a3b` | qwen35moe | 19.7 GB | 262144 | f16 | 6/40 | 6.80 GB |
-| `glm-4.7-flash-heretic` | deepseek2 | 16.2 GB | 202752 | q5_1 | 9/47 | 9.72 GB |
-| `qwen3.8-27b` | qwen35 | 15.3 GB | 262144 | q4_0 | 12/65 | 12.22 GB |
-| `gpt-oss-20b` | gpt-oss | 11.3 GB | 131072 | f16 | 6/24 | 13.61 GB |
-| `gemma-4-12b-it-heretic` | gemma4 | 6.9 GB | 131072 | f16 | 24/48 | 6.75 GB |
-| `qwen3.5-9b` | qwen35 | 5.2 GB | 262144 | f16 | 11/32 | 12.55 GB |
-| `gemma-4-e4b-it` | gemma4 | 5.0 GB | 131072 | f16 | 30/42 | 7.29 GB |
-| `qwen2.5-coder-7b` | qwen2 | 4.4 GB | 32768 | f16 | 23/28 | 6.29 GB |
-| `deepseek-r1-7b` | qwen2 | 4.4 GB | 131072 | f16 | 11/28 | 13.73 GB |
-| `gemma-3-4b-it` | gemma3 | 2.3 GB | 131072 | f16 | 34/34 | 5.44 GB |
-| `qwen3.5-0.8b-toolcalling` | qwen35 | 1.4 GB | 262144 | f16 | 24/24 | 4.16 GB |
-| `lfm2.5-1.2b` | lfm2 | 1.2 GB | 128000 | f16 | 16/16 | 3.08 GB |
-| `qwen3.5-0.8b` | qwen35 | 774 MB | 262144 | f16 | 24/24 | 3.94 GB |
-| `qwen2.5-0.5b` | qwen2 | 379 MB | 32768 | f16 | 24/24 | 2.66 GB |
+| `qwen3.5-35b-a3b` | qwen35moe | 19.7 GB | f16 | 2.44 GB | 7/40 | 5.81 GB |
+| `glm-4.7-flash-heretic` | deepseek2 | 16.2 GB | q8_0 | 6.48 GB | 9/47 | 8.89 GB |
+| `qwen3.8-27b` | qwen35 | 15.3 GB | q8_0 | 4.41 GB | 13/65 | 11.57 GB |
+| `gpt-oss-20b` | gpt-oss | 11.3 GB | f16 | 5.86 GB | 6/24 | 13.51 GB |
+| `gemma-4-12b-it-heretic` | gemma4 | 6.9 GB | f16 | 2.27 GB | 24/48 | 6.73 GB |
+| `qwen3.5-9b` | qwen35 | 5.2 GB | f16 | 3.91 GB | 16/32 | 9.51 GB |
+| `gemma-4-e4b-it` | gemma4 | 5.0 GB | f16 | 3.45 GB | 30/42 | 7.27 GB |
+| `deepseek-r1-7b` | qwen2 | 4.4 GB | f16 | 6.84 GB | 11/28 | 13.63 GB |
+| `gemma-3-4b-it` | gemma3 | 2.3 GB | f16 | 2.55 GB | 34/34 | 5.44 GB |
+| `qwen3.5-0.8b-toolcalling` | qwen35 | 1.4 GB | f16 | 1.46 GB | 24/24 | 4.16 GB |
+| `lfm2.5-1.2b` | lfm2 | 1.2 GB | f16 | 1.46 GB | 16/16 | 3.08 GB |
+| `qwen3.5-0.8b` | qwen35 | 774 MB | f16 | 1.46 GB | 24/24 | 3.94 GB |
 
 `claudelocal --cl-plan` prints the full working for the loaded one, plus a context/speed trade-off
 table.
@@ -390,6 +407,11 @@ Most of these cost hours to find, so they are written down rather than fixed sil
   this reason, so the proxy synthesizes them. It is driven by an **idle** timer, not "ping until the
   first byte": llama.cpp sends one bare `:` comment early and then goes quiet again, which is enough
   to stop a naive pinger and not enough to keep the client happy.
+- **Claude Code's opening prompt is ~33,500 tokens**, not the ~21k the system prompt alone accounts
+  for — tool definitions and the environment block make up the rest. A 32768-token model therefore
+  cannot run Claude Code *at all*: the first message overflows and auto-compact has nothing to
+  compact. Those models are kept out of the picker, both because they cannot work and because one of
+  them in the picker pins every other model to its window.
 - **llama.cpp build ≥ b10450.** Earlier builds have a broken CUDA path for Qwen3.8's DeltaNet layers
   and produce fluent garbage while looking completely healthy. `claudelocal --cl-doctor` checks the
   build number. This repo pins b10819.
