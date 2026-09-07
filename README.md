@@ -188,6 +188,32 @@ shared 128000-token window:
 `claudelocal --cl-plan` prints the full working for the loaded one, plus a context/speed trade-off
 table.
 
+### The KV cache is bought with model layers
+
+The cache and the weights compete for the same VRAM, so KV precision is paid for in GPU residency -
+and on a 6 GB card that is the single biggest lever on speed. Qwen3.5-9B at a 128000 window makes
+the point: its eight attention layers carry 4.00 GB of f16 KV between them, half a gigabyte each, so
+every attention layer placed on the card costs more VRAM in cache than four transformer layers cost
+in weights.
+
+Measured on an identical 25,010-token prompt:
+
+| KV | layers on GPU | weights on GPU | prompt processing | generation |
+|---|---|---|---|---|
+| f16 | 16 / 32 | 1.96 GB (37%) | 72.8 s · 352 tok/s | — |
+| **q8_0** | **22 / 32** | **2.68 GB (51%)** | **57.5 s** | 7.0 tok/s |
+| q4_0 | 27 / 32 | 3.29 GB (63%) | 45.6 s · 552 tok/s | 10.6 tok/s |
+
+Choosing on the RAM budget alone took f16 - 24 GB of free RAM had room for it - and left half the
+model being computed on the CPU for a cache nobody asked to be that precise. The planner now prefers
+the smaller cache whenever it wins layers, stopping at **q8_0**: that rung is effectively lossless,
+while q5_1 and q4_0 measurably cost long-context accuracy, so they stay a deliberate `--cl-kv`
+choice. A step down that wins no layers is never taken.
+
+It applies to every model, not just that one: `gemma-4-e4b-it` goes from 30 of 42 layers to **all
+42**, `deepseek-r1-7b` from 11 to 16, `gemma-4-12b` from 24 to 28. Models that already fit entirely
+on the card keep f16.
+
 ### Four families, four different KV caches
 
 A single `n_head_kv × head_dim × 2` figure is right for a plain dense transformer and wrong for

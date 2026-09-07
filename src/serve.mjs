@@ -269,7 +269,11 @@ export function ensureModel(entry, opts = {}) {
       ...opts,
       modelPath: entry.file,
       alias: entry.alias,
-      mmproj: opts.vision === false ? null : (entry.mmproj ?? null),
+      // Vision is opt-in, the same as it is on the command line. The router used to default it ON
+      // because it only checked for an explicit `false`, so switching to a model with a projector
+      // beside it silently spent ~0.9 GB of committed RAM on a capability the session was not
+      // using - RAM that the KV cache and the weights both wanted.
+      mmproj: opts.vision ? (entry.mmproj ?? null) : null,
       source: entry.source,
       // Each model has its own native window, so a context asked for on the command line is a
       // ceiling here rather than a target - nothing may exceed what the model was trained for.

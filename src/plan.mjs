@@ -31,6 +31,11 @@ const RAM_OVERHEAD = 1.2 * GiB;
 const KV_ELEM = { f16: 2, bf16: 2, q8_0: 1.0625, q5_1: 0.75, q4_0: 0.5625 };
 // Best quality first. The planner walks down this list until the KV cache fits the hard budget.
 const KV_LADDER = ["f16", "q8_0", "q5_1", "q4_0"];
+// How far the planner may step down the ladder on its own to win GPU residency, as opposed to
+// stepping down because RAM leaves it no choice. q8_0 is the floor because it is the last rung that
+// is effectively lossless; q5_1 and q4_0 measurably cost long-context accuracy, so they stay a
+// deliberate `--kv` choice by the user rather than something that happens quietly.
+const AUTO_KV_FLOOR = "q8_0";
 export const CTX_LADDER = [262144, 196608, 131072, 98304, 65536, 49152, 32768, 16384];
 
 const layerOf = (n) => { const m = n.match(/^blk\.(\d+)\./); return m ? +m[1] : -1; };
@@ -269,12 +274,42 @@ export function plan(modelOrPath, opts = {}) {
     };
   });
 
+  // Everything that leaves the whole CPU side of the model resident, best quality first.
+  const ramFits = candidates.filter((k) => k.ramWanted + ramMargin <= r.free);
+
+  // Picking the best-quality cache that fits RAM is only half the question, and on a small card it
+  // is the less important half. The KV cache and the weights compete for the SAME VRAM, so KV
+  // precision is bought with model layers - and a layer evicted to the CPU costs an order of
+  // magnitude more time per token than a slightly coarser cache costs accuracy.
+  //
+  // Qwen3.5-9B on this 6 GB card, at a 128000 window, is the case that makes the point. Its eight
+  // attention layers carry 4.00 GB of f16 KV between them - half a gigabyte each - so every
+  // attention layer placed on the card costs more VRAM in cache than four transformer layers cost
+  // in weights:
+  //
+  //     f16    3.91 GB KV   ->  16 of 32 layers on the GPU   (37% of the weights)
+  //     q8_0   2.08 GB KV   ->  22 of 32                     (51%)
+  //     q4_0   1.10 GB KV   ->  27 of 32                     (63%)
+  //
+  // Choosing on the RAM budget alone took f16, because 24 GB of free RAM had room for it - and left
+  // half the model being computed on the CPU for a cache nobody asked to be that precise.
+  const floor = KV_LADDER.indexOf(opts.kvFloor ?? AUTO_KV_FLOOR);
+  const gpuBest = ramFits
+    .filter((k) => KV_LADDER.indexOf(k.type) <= floor)
+    // Strictly greater, so a step down the ladder that wins no layers is never taken: quality is
+    // only ever spent on residency it actually buys.
+    .reduce((best, k) => (!best || k.nGpuLayers > best.nGpuLayers ? k : best), null);
+
   const p0 =
-    // best quality that leaves everything resident
-    candidates.find((k) => k.ramWanted + ramMargin <= r.free) ??
-    // else the smallest cache that at least keeps committed memory safe
+    gpuBest ??
+    ramFits[0] ??
+    // Nothing leaves the weights resident - fall back to the smallest cache that at least keeps
+    // committed memory safe, which is a slow plan rather than an unsafe one.
     [...candidates].reverse().find((k) => k.fitsHard) ??
     candidates[candidates.length - 1];
+  // For `explain`: did we trade cache precision for layers, or was this simply the best that fit?
+  const kvTradedForGpu = !!(gpuBest && ramFits[0] && gpuBest.type !== ramFits[0].type);
+  const kvBaseline = kvTradedForGpu ? { type: ramFits[0].type, nGpuLayers: ramFits[0].nGpuLayers } : null;
 
   const kvType = p0.type;
   const kvBytes = p0.kvBytes;
@@ -373,6 +408,16 @@ export function plan(modelOrPath, opts = {}) {
     cpuTensors: buildOverrides(m, placement, strategy),
     mtp: m.hasMTP,
     est,
+    kvTradedForGpu, kvBaseline,
+    // What the next rung down the ladder would buy, so the remaining trade is visible rather than
+    // something you have to go and measure. Only interesting while part of the model is still on
+    // the CPU.
+    kvNext: (() => {
+      if (placement.all) return null;
+      const i = KV_LADDER.indexOf(kvType);
+      const next = candidates.find((c) => KV_LADDER.indexOf(c.type) > i && c.nGpuLayers > placement.nGpuLayers);
+      return next ? { type: next.type, nGpuLayers: next.nGpuLayers, onGpu: next.weightsOnGpu } : null;
+    })(),
     ok: committedHeadroom > 0 && !!v,
     warnings,
   };
@@ -466,6 +511,14 @@ export function explain(p) {
   L.push("");
   L.push(`CPU        ${p.threads} generation / ${p.threadsBatch} batch threads at below-normal priority (${cpu().physical} cores, ${cpu().logical} threads)`);
   L.push(`extras     ${p.mtp ? "MTP speculative decoding on" : "no MTP head"}${p.outputOnGpu ? ", output head on GPU" : ", output head + embeddings in RAM"}`);
+  if (p.kvTradedForGpu) {
+    L.push(`KV choice  ${p.kvType} rather than ${p.kvBaseline.type} - on this card the cache competes with the weights.`);
+    L.push(`           ${p.kvBaseline.type} would fit RAM but leave only ${p.kvBaseline.nGpuLayers} layers on the GPU instead of ${p.nGpuLayers}.`);
+  }
+  if (p.kvNext) {
+    L.push(`speed      --kv ${p.kvNext.type} would put ${p.kvNext.nGpuLayers} of ${m.nBlocks} layers on the GPU (${fmtGB(p.kvNext.onGpu)}) instead of ${p.nGpuLayers}.`);
+    L.push("           Faster, at some cost to long-context accuracy - so it is not chosen for you.");
+  }
   L.push(`cache      ${e.cacheRam
     ? `${fmtGB(e.cacheRam)} prompt cache (of ${fmtGB(e.cacheWant)} wanted) - survives a side-request evicting the slot`
     : "no prompt cache - nothing left after the KV cache, so an evicted conversation is reprocessed from scratch"}`);
