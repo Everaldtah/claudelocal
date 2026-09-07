@@ -1,0 +1,15 @@
+# The weights. 15-20 GB per model, and every one of them is a download away:
+#   claudelocal --cl-pull   or LM Studio / ollama
+models/
+*.gguf
+
+# The llama.cpp CUDA build - ~1 GB of prebuilt binaries.
+#   claudelocal --cl-install   fetches the pinned build
+runtime/
+
+# Per-machine state, written at runtime.
+logs/
+state.json
+models.json
+
+node_modules/
