@@ -23,6 +23,9 @@ import { ram, cpu, gpu, GiB, MiB, fmtGB } from "./sys.mjs";
 // the driver spills into shared system memory, which on Windows looks like a frozen desktop rather
 // than an error - so this is deliberately generous.
 const VRAM_RESERVE = 768 * MiB;
+// Turbo spends the card down to a thinner line. The desktop still needs its slice, and the
+// serve-level OOM backoff (+512 MiB per retry) is the safety net if the thinner estimate was wrong.
+export const TURBO_VRAM_RESERVE = 512 * MiB;
 const COMPUTE_PER_UBATCH = 1.4 * MiB;
 // llama.cpp host buffers, the tokenizer and the HTTP server. Committed, unlike the mmap'd weights.
 const RAM_OVERHEAD = 1.2 * GiB;
@@ -236,11 +239,19 @@ export function plan(modelOrPath, opts = {}) {
 
   // ssm-pack only means anything on a hybrid model - on a plain transformer there are no recurrent
   // layers to pack, so it would put nothing on the card at all.
-  const strategy = (opts.strategy === "ssm-pack" && m.ssmLayers.length) ? "ssm-pack" : "layers";
+  //
+  // "turbo" wants one thing only: EVERY layer on the GPU, because a dense model's token rate is
+  // set by how many bytes of weights leave the fast memory per token. Whatever it takes to get
+  // there - a coarser KV cache than the quality ladder would choose, and a thinner VRAM reserve -
+  // is a deliberate trade the user made by picking the turbo row, not something that should happen
+  // quietly. If no KV rung keeps the whole model resident, turbo degrades to the normal choice
+  // rather than claiming a speed it cannot deliver.
+  const strategy = opts.strategy === "turbo" ? "turbo"
+    : (opts.strategy === "ssm-pack" && m.ssmLayers.length) ? "ssm-pack" : "layers";
   const ubatch = opts.ubatch ?? 256;
   const batch = opts.batch ?? 1024;
   const ramMargin = (opts.ramMarginGB ?? 2) * GiB;
-  const vramReserve = opts.vramReserve ?? VRAM_RESERVE;
+  const vramReserve = opts.vramReserve ?? (strategy === "turbo" ? TURBO_VRAM_RESERVE : VRAM_RESERVE);
   const computeBytes = Math.round(ubatch * COMPUTE_PER_UBATCH);
   const vramFree = v ? Math.max(0, v.free) : 0;
   // Default to the model's full native context. That is the whole point of this setup: the user
@@ -300,7 +311,16 @@ export function plan(modelOrPath, opts = {}) {
     // only ever spent on residency it actually buys.
     .reduce((best, k) => (!best || k.nGpuLayers > best.nGpuLayers ? k : best), null);
 
+  // Turbo accepts exactly one outcome: every layer resident. Among the KV rungs that achieve it,
+  // take the finest cache the card can still afford - and if none of them does, fall through to
+  // the normal choice instead of returning a plan that is not actually turbo.
+  const allFit = candidates.filter((k) => k.all);
+  const turboBest = allFit.length
+    ? allFit.reduce((best, k) => (KV_LADDER.indexOf(k.type) < KV_LADDER.indexOf(best.type) ? k : best))
+    : null;
+
   const p0 =
+    (strategy === "turbo" ? turboBest : null) ??
     gpuBest ??
     ramFits[0] ??
     // Nothing leaves the weights resident - fall back to the smallest cache that at least keeps
@@ -514,6 +534,13 @@ export function explain(p) {
   if (p.kvTradedForGpu) {
     L.push(`KV choice  ${p.kvType} rather than ${p.kvBaseline.type} - on this card the cache competes with the weights.`);
     L.push(`           ${p.kvBaseline.type} would fit RAM but leave only ${p.kvBaseline.nGpuLayers} layers on the GPU instead of ${p.nGpuLayers}.`);
+  }
+  if (p.strategy === "turbo") {
+    if (p.nGpuLayers === m.nBlocks) {
+      L.push(`turbo        all ${m.nBlocks} layers pinned to the GPU - ${p.kvType} KV is the finest cache the card can still hold at this window.`);
+    } else {
+      L.push(`turbo        could not keep all ${m.nBlocks} blocks resident at this window - this is the normal plan, not a turbo one.`);
+    }
   }
   if (p.kvNext) {
     L.push(`speed      --kv ${p.kvNext.type} would put ${p.kvNext.nGpuLayers} of ${m.nBlocks} layers on the GPU (${fmtGB(p.kvNext.onGpu)}) instead of ${p.nGpuLayers}.`);

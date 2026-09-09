@@ -19,7 +19,8 @@ import os from "node:os";
 import path from "node:path";
 import { readGGUF, archInfo } from "./gguf.mjs";
 import { discoverRemotes } from "./remotes.mjs";
-import { paths, readJSON, GiB, MiB } from "./sys.mjs";
+import { paths, readJSON, gpu, readState, GiB, MiB } from "./sys.mjs";
+import { plan } from "./plan.mjs";
 
 // What Claude Code sends before the conversation has started at all: system prompt, tool
 // definitions, environment block. MEASURED on this machine at 33,096-33,522 tokens across several
@@ -292,6 +293,25 @@ export function discover({ refresh = false, minCtx = MIN_CTX } = {}) {
   }
   skipped.push(...remote.skipped);
 
+  // A turbo row is the same model asked for a different way: every layer on the GPU, whatever KV
+  // precision and VRAM reserve it takes, because a dense model's token rate is set by how much of
+  // its weights live in VRAM. It is offered only when the planner can actually deliver that -
+  // a turbo row that loads as a normal plan would be a lie in the picker.
+  //
+  // Plan against the card as it will be at load time, not as it is right now: a resident
+  // llama-server is torn down before a switch, so its working set is already free. Reading
+  // gpu().free while one is running sees a few hundred megabytes and drops every row.
+  const g = gpu();
+  const probeFree = g ? (readState().model ? g.total - 256 * MiB : g.free) : 0;
+  for (const m of [...models]) {
+    if (m.source === "remote" || m.bytes >= probeFree) continue;
+    const turboCtx = Math.min(minCtx, m.nCtxTrain);
+    let p;
+    try { p = plan(m.file, { strategy: "turbo", ctx: turboCtx }); } catch { continue; }
+    if (!p.ok || p.nGpuLayers !== m.nBlocks) continue;
+    models.push({ ...m, alias: `${m.alias}-turbo`, turbo: true, nCtxTrain: turboCtx });
+  }
+
   // Two managers holding the same model, or two quants of one model, collide on a single alias -
   // and an alias that resolves to two different files is worse than an ugly one. Bigger first, so
   // when the same model exists twice the better copy keeps the clean name.
@@ -345,13 +365,16 @@ export function pickerRows(models, { ctxOf, includeAuto = true } = {}) {
       // where it runs instead - which is the thing worth knowing before picking it.
       m.source === "remote" ? `hosted at ${hostOf(m.ref)}` : `${HUMAN(m.bytes)} on disk`,
       `${Math.round(ctx / 1024)}k ctx`,
+      m.turbo ? "every layer in VRAM - max tok/s" : null,
       m.source,
     ].filter(Boolean);
     return {
       model: m.alias,
       // HuggingFace conversions prefix general.name with the uploading org ("Qwen_Qwen3.5 35B
-      // A3B"), which is noise in a picker that is already only local models.
-      label: String(m.name).replace(/^[A-Za-z0-9]+_/, "").replace(/_/g, " ").trim() || m.alias,
+      // A3B"), which is noise in a picker that is already only local models. The turbo twin is
+      // the same model, so the only thing the label owes the user is which loading it is.
+      label: (String(m.name).replace(/^[A-Za-z0-9]+_/, "").replace(/_/g, " ").trim() || m.alias)
+        + (m.turbo ? " (turbo)" : ""),
       description: bits.join(" · "),
       // Claude Code will not offer a row for a model it has never heard of unless it is told whose
       // client-side handling to borrow - prompt profile, capability and effort defaults. Sonnet 4.5

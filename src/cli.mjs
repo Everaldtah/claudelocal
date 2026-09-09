@@ -218,10 +218,18 @@ async function cmdUp() {
   }
 
   say(`[claudelocal] starting ${boot.alias} (${boot.name}, ${human(boot.bytes)}, ${boot.source}) ...`);
+  const po = planOpts();
+  // The turbo twin is the same file under a different loading, so the ROW decides its strategy -
+  // and a "turbo" left in state.json by a previous turbo load must not leak onto a normal row,
+  // where it would spend VRAM the user did not ask to spend.
+  let strategy = po.strategy;
+  if (boot.turbo) strategy = "turbo";
+  else if (!flag("strategy") && strategy === "turbo") strategy = "layers";
   const r = await up({
-    ...planOpts(),
+    ...po,
+    strategy,
     modelPath: boot.file, alias: boot.alias, source: boot.source,
-    mmproj: planOpts().vision === false ? null : (boot.mmproj ?? null),
+    mmproj: po.vision === false ? null : (boot.mmproj ?? null),
     ctx: Math.min(ctx, boot.nCtxTrain),
     onProgress: (line, g) => {
       const mem = g ? `  avail ${g.availMB} MB` : "";

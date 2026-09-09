@@ -14,7 +14,7 @@ import path from "node:path";
 // retry starts a second load against memory the first one is still taking.
 const run = promisify(execFile);
 import { paths, httpJSON, readJSON, readState, writeState, GiB, MiB, fmtGB, ram, gpu } from "./sys.mjs";
-import { plan, serverArgs, explain } from "./plan.mjs";
+import { plan, serverArgs, explain, TURBO_VRAM_RESERVE } from "./plan.mjs";
 
 export const DEFAULT_PORT = 20180;
 export const DEFAULT_PROXY_PORT = 20181;
@@ -97,7 +97,10 @@ export async function up(opts = {}) {
   let extraReserve = 0;
   for (let i = 0; ; i++) {
     try {
-      return await start({ ...opts, vramReserve: (opts.vramReserve ?? 768 * MiB) + extraReserve });
+      // Turbo already spends the card down to a thinner line in the plan, so it brings its own
+      // (smaller) reserve - and the OOM backoff below still adds 512 MB per retry on top of it.
+      const reserve = opts.vramReserve ?? (opts.strategy === "turbo" ? TURBO_VRAM_RESERVE : 768 * MiB);
+      return await start({ ...opts, vramReserve: reserve + extraReserve });
     } catch (e) {
       const last = i >= attempts - 1;
       if (last || !OOM.test(e.message)) throw e;
@@ -269,6 +272,9 @@ export function ensureModel(entry, opts = {}) {
       ...opts,
       modelPath: entry.file,
       alias: entry.alias,
+      // The turbo twin is the same file under a different loading, and the strategy is the whole
+      // difference - so the row decides it, not the caller.
+      strategy: entry.turbo ? "turbo" : opts.strategy,
       // Vision is opt-in, the same as it is on the command line. The router used to default it ON
       // because it only checked for an explicit `false`, so switching to a model with a projector
       // beside it silently spent ~0.9 GB of committed RAM on a capability the session was not
