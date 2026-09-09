@@ -207,7 +207,7 @@ async function start(opts = {}) {
   });
 
   writeState({
-    port, model: modelPath, modelName: p.model.name, alias, source: opts.source ?? null,
+    port, model: modelPath, modelName: p.model.name, alias, lastAlias: alias, source: opts.source ?? null,
     vision: !!mmproj,
     ctx: p.ctx, kvType: p.kvType, strategy: p.strategy,
     ngl: p.ngl, nGpuLayers: p.nGpuLayers, mtp: p.mtp,

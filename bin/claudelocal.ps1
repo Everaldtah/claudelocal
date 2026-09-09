@@ -21,11 +21,13 @@ $cli = Join-Path $script:Root 'src\cli.mjs'
 function Show-Help {
     Write-Host ''
     Write-Host 'claudelocal - Claude Code on any local model on this machine' -ForegroundColor Cyan
-    Write-Host '  claudelocal                 load a model and start Claude Code'
+    Write-Host '  claudelocal                 start Claude Code with NO model loaded (/model loads one)'
     Write-Host '  claudelocal -p "prompt"     any normal claude argument passes through'
     Write-Host ''
-    Write-Host '  claudelocal --cl-models     every local model found, and what /model will offer'
-    Write-Host '  claudelocal --cl-model A    load a specific model by alias'
+    Write-Host '  claudelocal --cl-models     every model found, and what /model will offer'
+    Write-Host '  claudelocal --cl-remotes    remote models from remotes.json (--cl-check to call them)'
+    Write-Host '  claudelocal --cl-model A    load a specific model by alias at startup'
+    Write-Host '  claudelocal --cl-load       load the last-used model at startup, as it used to'
     Write-Host '  claudelocal --cl-min-ctx N  drop models below N tokens, raising the shared window'
     Write-Host '  claudelocal --cl-rescan     re-read every GGUF header'
     Write-Host ''
@@ -51,11 +53,18 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Write-Host '[claude
 $upArgs    = @()
 $passthru  = @()
 $subcmd    = $null
+# Starting up used to mean loading a model - whichever one happened to be loaded last - which is
+# minutes of waiting and 15 GB of RAM spent before a single word is typed. Now nothing is loaded
+# until a model is picked in /model; --cl-load or --cl-model asks for the old behaviour.
+$preload   = $false
 $list = @($args)
 for ($i = 0; $i -lt $list.Count; $i++) {
     switch ($list[$i]) {
         '--cl-models'   { $subcmd = 'models' }
-        '--cl-model'    { $i++; $upArgs += @('--model', $list[$i]) }
+        '--cl-remotes'  { $subcmd = 'remotes' }
+        '--cl-check'    { $upArgs += '--check' }
+        '--cl-model'    { $i++; $upArgs += @('--model', $list[$i]); $preload = $true }
+        '--cl-load'     { $preload = $true }
         '--cl-min-ctx'  { $i++; $upArgs += @('--min-ctx', $list[$i]) }
         '--cl-rescan'   { $upArgs += '--rescan' }
         '--cl-plan'     { $subcmd = 'plan' }
@@ -80,8 +89,13 @@ for ($i = 0; $i -lt $list.Count; $i++) {
 
 if ($subcmd) { & node $cli $subcmd @upArgs; exit $LASTEXITCODE }
 
+if (-not $preload) { $upArgs += '--no-load' }
 & node $cli up @upArgs
-if ($LASTEXITCODE -ne 0) { Write-Host '[claudelocal] the model did not load - not starting Claude Code.' -ForegroundColor Red; exit 1 }
+if ($LASTEXITCODE -ne 0) {
+    $why = if ($preload) { 'the model did not load' } else { 'the proxy did not come up' }
+    Write-Host "[claudelocal] $why - not starting Claude Code." -ForegroundColor Red
+    exit 1
+}
 
 $stateFile = Join-Path $script:Root 'state.json'
 $state = Get-Content $stateFile -Raw | ConvertFrom-Json
@@ -159,8 +173,18 @@ foreach ($k in $vars.Keys) {
     else { Set-Item "Env:$k" $vars[$k] }
 }
 
-Write-Host "[claudelocal] Claude Code -> $($state.alias) @ $($state.baseUrl)  (ctx $($state.ctx), KV $($state.kvType), $($state.nGpuLayers) layers on GPU)" -ForegroundColor DarkGray
-Write-Host "[claudelocal] /model switches between every local model - the swap costs one model load." -ForegroundColor DarkGray
+# A remote has no memory plan to report - nothing was loaded on this machine - so the usual
+# ctx/KV/layers line would print three empty fields.
+if (-not $state.alias) {
+    Write-Host "[claudelocal] Claude Code -> nothing loaded yet  (session context $($state.sessionCtx))" -ForegroundColor DarkGray
+    Write-Host "[claudelocal] press /model and pick one - choosing a model is what loads it." -ForegroundColor DarkGray
+} elseif ($state.source -eq 'remote') {
+    Write-Host "[claudelocal] Claude Code -> $($state.alias) (remote) @ $($state.baseUrl)  (ctx $($state.ctx), nothing loaded locally)" -ForegroundColor DarkGray
+    Write-Host "[claudelocal] /model switches between local models and remotes - a remote switch is instant." -ForegroundColor DarkGray
+} else {
+    Write-Host "[claudelocal] Claude Code -> $($state.alias) @ $($state.baseUrl)  (ctx $($state.ctx), KV $($state.kvType), $($state.nGpuLayers) layers on GPU)" -ForegroundColor DarkGray
+    Write-Host "[claudelocal] /model switches between every model - a local swap costs one model load." -ForegroundColor DarkGray
+}
 try {
     $claude = Get-Command claude -ErrorAction SilentlyContinue
     if ($claude) { & $claude.Source @passthru }

@@ -15,6 +15,11 @@ Then, inside Claude Code:
 
 and every GGUF on the machine is in the list. Pick one and the next message loads it.
 
+Starting up loads **nothing**: `claudelocal` brings up only the router, which is all `/model` needs to
+list the models and to load the one that is picked. A message sent before picking comes straight back
+with "no model is loaded" rather than quietly spending two minutes and 15 GB on whatever was used
+last. `claudelocal --cl-load` loads the last-used model at startup, the way it used to.
+
 ---
 
 ## What this is
@@ -352,16 +357,207 @@ read from system RAM for every token. Two things claw some back:
   DeltaNet layers. Costs a boundary crossing per layer, and depends on how llama.cpp places the KV
   for `-ot`-overridden layers — which is why it is *measured* rather than assumed.
 
+## Models that are not on this machine
+
+Some models cannot run here at any quantization. GLM-5.3 is 744B-A40B and its smallest useful quant
+is ~150 GB; Kimi K3 is 2.8T-A104B and its 1-bit dynamic GGUF is 594 GB. A 6 GB card is not what
+fails first — a 20 GB disk is.
+
+`remotes.json` adds them to the same picker anyway. An entry is a base URL, a model id and a key:
+
+```json
+{
+  "glm-4.7-flash-kaggle": {
+    "label": "GLM-4.7-Flash (Kaggle T4x2)",
+    "baseUrl": "https://something.trycloudflare.com",
+    "model": "glm-4.7-flash",
+    "apiKey": "sk-cl-...",
+    "ctx": 131072
+  }
+}
+```
+
+They appear in `/model` beside the local GGUFs and route the same way — the difference is that a
+remote switch is instant, because nothing is loaded or unloaded. Three cases use one mechanism:
+
+| | |
+|---|---|
+| **a borrowed GPU** | `llama-server` on Kaggle or Colab behind a tunnel |
+| **a provider API** | GLM-5.3 at Z.ai, Kimi K3 at Moonshot — Anthropic-compatible, so no translation |
+| **another box** | a `llama-server` on the LAN, no key needed |
+
+Requests to those are **passed through unmodified**. The rewriting the proxy does for
+`llama-server` exists to satisfy a jinja chat template — dropping `thinking`, stripping
+`cache_control`, merging same-role turns — and a hosted Anthropic endpoint wants none of it. These
+endpoints are built to receive Claude Code's own traffic; Claude Code talks to them with no proxy at
+all, so the body goes out as it arrived with only the model id swapped.
+
+### OpenAI-only providers
+
+`api: "openai"` is the exception, and it exists for NVIDIA's `build.nvidia.com` catalog — which
+serves Kimi K3 free, and speaks Chat Completions and nothing else. `src/openai.mjs` bridges it in
+both directions. The field names are the easy half; the shapes are not:
+
+| | |
+|---|---|
+| **tool results** | Anthropic puts them in a *user* turn as `tool_result` blocks. OpenAI wants one `role:"tool"` message each, unbroken, right after the assistant turn that called them — so one message fans out into several. |
+| **reasoning** | OpenAI has no thinking block. NVIDIA streams `reasoning_content` beside `content`, so it becomes a real Anthropic thinking block — emitted downstream, stripped on the way back up, because a replayed thinking block needs a signature there is no way to produce. |
+| **streaming** | OpenAI sends one flat delta channel whose block structure is *implied* by which field moved. Anthropic brackets every block explicitly. The translator is a state machine, not a mapper. |
+| **token counting** | There is no OpenAI equivalent of `/v1/messages/count_tokens`, so it is answered locally from an estimate instead of 404ing. |
+
+### Fallback keys
+
+NVIDIA's free tier limits **both** how many requests a key has in flight (about one) and how many it
+may spend over a window — and Claude Code fires side-requests alongside the main turn. So `429` is a
+normal state on that endpoint, not a failure. A remote can name `fallback` aliases: sibling entries
+pointing at the same endpoint under a different key.
+
+```json
+"kimi-k3":           { "…": "…", "fallback": ["kimi-k3-fallback1"] },
+"kimi-k3-fallback1": { "…": "…", "fallback": ["kimi-k3-fallback2"] },
+"kimi-k3-fallback2": { "…": "…" }
+```
+
+Each key points at the *next* one rather than the primary listing them all, so adding a key is one
+edit. Each also appears in `/model` on its own, so a key can be pinned deliberately.
+
+Automatically, the chain is walked in order on `429`, `5xx` or a refused connection — and only while
+nothing of the answer has reached Claude Code yet, so a turn is never restarted mid-sentence. When
+every key is busy the proxy walks the chain again up to four times with backoff (honouring
+`Retry-After`), pinging the open stream throughout, which turns a rate limit into a pause rather
+than a failed turn. A fallback alias added to `remotes.json` *during* a session is picked up on the
+next request — which is the moment you actually reach for one.
+
+The quota is per key and measured over a window, so three keys is roughly three times the budget,
+not just three times the concurrency. Observed here, with two keys already spent:
+
+```
+routing to remote kimi-k3 (https://integrate.api.nvidia.com)
+failing over kimi-k3 -> kimi-k3-fallback1 after 429
+failing over kimi-k3-fallback1 -> kimi-k3-fallback2 after 429
+                                        ... and the turn completed on the third key
+```
+
+**The limit is per MODEL, not per key.** Measured here: on one key, at the same moment,
+`moonshotai/kimi-k3` answered 429 while `meta/llama-3.2-11b-vision-instruct` answered 200. So a
+429 on a popular model is that model's shared free-tier capacity, and adding keys does not buy much
+of it — one probe every 45 s for eight minutes was rejected every time, far below any per-minute
+rate limit, with no `Retry-After` to predict the recovery.
+
+Which means the most useful last hop in a chain is a **different model**, not a fourth key. A
+fallback entry is an ordinary remote, so it can name anything — the hops need not agree on model,
+provider or even protocol:
+
+```json
+"kimi-k3-fallback2": { "…": "…", "fallback": ["deepseek-v4-pro"] },
+"deepseek-v4-pro":   { "api": "openai", "model": "deepseek-ai/deepseek-v4-pro-0813", "…": "…" }
+```
+
+The turn then completes on a model that is actually available rather than failing, at the cost of it
+not being the model you picked — which is why the alias that answered is named in the log.
+
+`remotes.json` is gitignored, because it may hold a key. Start from `remotes.example.json`.
+
+```
+claudelocal --cl-remotes              what is configured, and whether each has its key
+claudelocal --cl-remotes --cl-check   actually call each one and time it
+```
+
+A remote can also be booted directly, in which case **no `llama-server` starts at all** and the
+machine's RAM and VRAM are never touched:
+
+```
+claudelocal --cl-model glm-4.7-flash-kaggle
+```
+
+### Running the big local models on a Kaggle T4 x2
+
+`kaggle/claudelocal-kaggle.ipynb` serves **Qwen3.8-27B** and **GLM-4.7-Flash** from one free Kaggle
+node and tunnels them here. The point is VRAM: a 6 GB 3050 runs Qwen3.8-27B mostly out of system
+RAM, while 32 GB of T4 holds it entirely on the GPU.
+
+| | |
+|---|---|
+| Qwen3.8-27B UD-Q4_K_M | 15.3 GB |
+| GLM-4.7-Flash UD-Q4_K_XL | 16.3 GB |
+| Both on disk | 31.7 GB — fits `/tmp` (~60 GB), not the 20 GB `/kaggle/working` |
+| One resident | ~22 GB of 32 GB VRAM, fully offloaded, 131072-token window |
+
+They cannot both be resident — 31.7 GB of weights against 32 GB of VRAM — so
+[llama-swap](https://github.com/mostlygeek/llama-swap) loads whichever one a request names. That is
+the same one-at-a-time behaviour this repo already has locally, and it speaks the Anthropic
+`/v1/messages` endpoint, so the proxy needs no special case for it.
+
+Upload the notebook, set **GPU T4 x2** and **Internet on**, and Run All. It prints a `remotes.json`
+block to paste here. Caveats worth knowing before relying on it:
+
+- **9 hours per session, 30 h/week** of free GPU quota.
+- **The tunnel URL and key are new every session**, so the block needs re-pasting each time.
+- llama.cpp ships no prebuilt CUDA binary for Linux, so the notebook compiles `llama-server` for
+  sm_75 (~15 minutes). Setting **Persistence → Files only** caches it in `/kaggle/working` and later
+  sessions skip the build. The 32 GB of weights are re-downloaded each session regardless.
+- A Cloudflare quick tunnel is a **public URL**. The notebook generates a random key and llama-swap
+  rejects requests without it, so the endpoint is not open to whoever finds the hostname.
+
+### Running Qwen3.8-27B on a free Kaggle TPU
+
+A TPU cannot run a GGUF. llama.cpp has no TPU backend — its backends are CPU, CUDA, Metal, Vulkan,
+SYCL, ROCm, CANN and OpenCL — and TPUs execute XLA graphs, so the quantized files this repo is built
+around are unreachable there. That rules out the *format*, not the *model*: the same weights in
+**bf16 safetensors**, served by vLLM's TPU backend, run fine.
+
+Kaggle now hands out **TPU v5e-8** (v3-8 was phased out), which vLLM supports properly rather than
+experimentally. 8 chips x 16 GB = 128 GB HBM, and Qwen3.8-27B in bf16 is 51.7 GB, so it fits with
+room for a real KV cache:
+
+| | TPU v5e-8, bf16, TP=8 | T4 x2, GGUF Q4 |
+|---|---|---|
+| Quantization | **none** — full bf16 | Q4_K_M / Q4_K_XL |
+| Context | 262144 | 131072 |
+| Decode | ~130 tok/s | far slower |
+| Models served | **one** | two, swappable |
+
+[`ARahim3/kaggle-tpu-lab`](https://github.com/ARahim3/kaggle-tpu-lab) already does this end to end —
+pinned bf16 weights and an XLA compile cache as Kaggle datasets, cloudflared tunnel, and both an
+OpenAI `/v1/chat/completions` and an Anthropic `/v1/messages` endpoint. It is cloned to
+`~/Projects/kaggle-tpu-lab`:
+
+```
+python launch.py serve                 # ~22 min, or --fast-start for ~6
+python launch.py status -f             # re-attach; Ctrl-C detaches without stopping
+python launch.py stop                  # kill the TPU session
+```
+
+It prints a URL and key; paste them into the `qwen3.8-27b-tpu` entry and set `enabled` true.
+
+**That server authenticates with `Authorization: Bearer` only and rejects `x-api-key`**, which is
+what the entry's `"authStyle": "bearer"` is for — the default sends both headers.
+
+To actually get the 262144-token window, raise the floor so the small local models stop pinning the
+shared session context: `claudelocal --cl-min-ctx 262144` leaves the TPU entry and the four local
+262k models in the picker.
+
+**Why GLM-4.7-Flash is not on the TPU.** In bf16 it is 58.2 GB, so the two together are ~110 GB of
+weights against 128 GB of HBM — before any KV cache, at a context where the KV is the expensive
+part. vLLM also serves one model per process and cannot hot-swap: a switch means a fresh ~22 minute
+XLA compile, so nothing like the llama-swap arrangement on the T4 is possible. On top of that,
+`kaggle-tpu-lab` is hard-wired to Qwen3.8-27B (its weights and compile cache are prebuilt datasets),
+so GLM there would mean building a 58 GB weights dataset and a serve script against unverified
+vllm-tpu support for its MoE architecture. The TPU is the one-model, no-quantization, fast option;
+the T4 x2 notebook is the two-model, swappable one.
+
 ## Commands
 
 ```
-claudelocal                    load a model and start Claude Code
+claudelocal                    start Claude Code with no model loaded - /model loads one
+claudelocal --cl-load          also load the last-used model at startup
 claudelocal -p "..."           any normal claude argument passes straight through
 
-claudelocal --cl-models        every local model found, and why anything was left out
+claudelocal --cl-models        every model found, local and remote, and why anything was left out
 claudelocal --cl-model ALIAS   load a specific model
 claudelocal --cl-min-ctx N     drop models below N tokens, raising the shared window
 claudelocal --cl-rescan        re-read every GGUF header instead of trusting models.json
+claudelocal --cl-remotes       remotes.json entries and their keys (--cl-check calls them)
 
 claudelocal --cl-plan          memory plan + context/speed trade-off table
 claudelocal --cl-status        server / proxy / guard / RAM / VRAM
@@ -398,16 +594,22 @@ found. If LM Studio or ollama already have models installed, there is nothing el
 
 ```
 src/registry.mjs   finds every GGUF across claudelocal / LM Studio / ollama, names them
+src/remotes.mjs    models that are not on this machine, read from remotes.json
+src/openai.mjs     Anthropic Messages <-> OpenAI Chat Completions, request/response/stream
 src/gguf.mjs       GGUF header + tensor table reader (exact byte sizes, works on a partial download)
 src/sys.mjs        live RAM / VRAM / CPU / disk probes
 src/plan.mjs       the planner: layer placement, per-layer KV modelling, hard vs soft RAM budgets
 src/guard.ps1      Job Object commit cap, below-normal priority, memory watchdog
 src/serve.mjs      starts llama-server under the guard, waits for health, switches models
-src/proxy.mjs      the router + Claude Code -> llama-server /v1/messages normalizing shim
+src/proxy.mjs      the router + Claude Code -> llama-server /v1/messages normalizing shim,
+                   and the passthrough path out to a remote
 src/cli.mjs        models / settings / plan / up / down / status / bench / tune / doctor / pull
 bin/claudelocal.ps1   the launcher: loads a model, builds the /model picker, execs claude
 runtime/           llama.cpp CUDA build (b10819)   [not in git]
 models/            GGUF weights                    [not in git]
+kaggle/            notebook serving Qwen3.8-27B + GLM-4.7-Flash from a free T4 x2
+remotes.json       remote endpoints and their keys    [not in git]
+remotes.example.json  every field, with worked examples
 logs/              server.log, guard.log, guard.json, proxy.log
 ```
 

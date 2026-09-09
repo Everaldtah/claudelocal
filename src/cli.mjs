@@ -8,6 +8,7 @@ import { inspect, plan, explain, ladder, serverArgs } from "./plan.mjs";
 import { up, down, health, findModel, findMmproj, serverExe, guardStatus, tailLog, DEFAULT_PORT, DEFAULT_PROXY_PORT } from "./serve.mjs";
 import { PROXY_VERSION } from "./proxy.mjs";
 import { discover, resolve as resolveModel, pickerRows, human, AUTO_ALIAS, MIN_CTX, CLAUDE_CODE_BASE_TOKENS } from "./registry.mjs";
+import { isRemote, remoteKey, REMOTES_FILE } from "./remotes.mjs";
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] ?? "help";
@@ -31,7 +32,11 @@ function bootModel(models) {
     if (!m) die(`no local model matches "${asked}"\n  run: claudelocal models`);
     return m;
   }
-  const last = readState().alias;
+  // `alias` is what is loaded RIGHT NOW and is null while nothing is; `lastAlias` is what was
+  // loaded last, which is what "the same model as yesterday" has to mean once a bare start loads
+  // nothing at all.
+  const st = readState();
+  const last = st.alias ?? st.lastAlias;
   return (last && resolveModel(last, models))
     ?? models.find((m) => m.source === "claudelocal")
     ?? models[0];
@@ -146,7 +151,11 @@ async function cmdPlan() {
 
 function requireModel() {
   const { models } = registry();
-  const m = models.length ? bootModel(models).file : findModel(opt("model", null));
+  // `plan` and `bench` measure THIS machine, so a remote has nothing for them to measure.
+  const local = models.filter((x) => !isRemote(x));
+  const boot = local.length ? bootModel(local) : null;
+  if (boot && isRemote(boot)) die(`${boot.alias} runs remotely - there is no local memory plan for it`);
+  const m = boot ? boot.file : findModel(opt("model", null));
   if (!m) die(`no usable local model found\n  run: claudelocal models   (or: claudelocal pull)`);
   const size = fs.statSync(m).size;
   if (size < 1 * GiB) die(`${path.basename(m)} looks incomplete (${fmtGB(size)}) - the download may still be running.\n  run: claudelocal pull   (it resumes)`);
@@ -157,9 +166,56 @@ async function cmdUp() {
   const t0 = Date.now();
   const { models } = registry();
   if (!models.length) die(`no usable local models found\n  run: claudelocal pull   (or install one in LM Studio / ollama)`);
-  const boot = bootModel(models);
   const ctx = sessionCtx(models);
+
+  // --- the idle start ---------------------------------------------------------------------------
+  // A bare `claudelocal` loads NOTHING. Only the proxy goes up - which is all that /model needs to
+  // list every model and to load the one that gets picked. Starting the CLI should not commit two
+  // minutes and 15 GB to a model chosen for you by what you happened to run last.
+  if (flag("no-load") && !opt("model", null)) {
+    warnIfTooSmall(ctx);
+    const st = readState();
+    const live = await health(PORT);
+    // A server left up by an earlier session is not evicted - it is already resident, so nothing
+    // new gets loaded either way and switching back to it costs nothing.
+    if (live && st.model) {
+      say(`[claudelocal] ${st.alias} is still loaded from an earlier session (ctx ${st.ctx})`);
+    } else {
+      writeState({
+        lastAlias: st.alias ?? st.lastAlias ?? null,
+        alias: null, modelName: null, source: null, model: null,
+        ctx: null, kvType: null, ngl: null, nGpuLayers: null, vision: false,
+      });
+      say(`[claudelocal] nothing loaded - open /model and pick one; that is what loads it`);
+    }
+    const px = await proxyUp(PROXY_PORT, PORT, ctx);
+    say(`[claudelocal] proxy on http://127.0.0.1:${PROXY_PORT} (pid ${px.pid}), ${models.length} models switchable from /model`);
+    writeState({ proxyPort: PROXY_PORT, baseUrl: `http://127.0.0.1:${PROXY_PORT}`, sessionCtx: ctx });
+    return { idle: true, port: PROXY_PORT };
+  }
+
+  const boot = bootModel(models);
   warnIfTooSmall(ctx);
+
+  // A remote needs no llama-server at all: nothing is planned, nothing is loaded, and the machine's
+  // RAM and VRAM are never touched. The proxy still goes up - it is what Claude Code is pointed at
+  // and what routes a later /model switch back to a local model.
+  if (isRemote(boot)) {
+    if (!remoteKey(boot) && boot.remote.apiKeyEnv) {
+      say(`[claudelocal] WARNING  ${boot.alias} authenticates with ${boot.remote.apiKeyEnv}, which is not set.`);
+      say(`[claudelocal]          Set it, or put "apiKey" in ${REMOTES_FILE}, or requests will fail.`);
+    }
+    writeState({
+      alias: boot.alias, lastAlias: boot.alias, modelName: boot.name, source: "remote", model: null,
+      ctx: Math.min(ctx, boot.nCtxTrain), kvType: null, ngl: null, nGpuLayers: null, vision: false,
+    });
+    say(`[claudelocal] ${boot.alias} is remote (${boot.remote.baseUrl}) - nothing loaded on this machine`);
+    const pxr = await proxyUp(PROXY_PORT, PORT, ctx);
+    say(`[claudelocal] proxy on http://127.0.0.1:${PROXY_PORT} (pid ${pxr.pid})`);
+    say(`[claudelocal] ${models.length} models switchable from /model`);
+    writeState({ proxyPort: PROXY_PORT, baseUrl: `http://127.0.0.1:${PROXY_PORT}`, sessionCtx: ctx });
+    return { remote: true, port: PROXY_PORT };
+  }
 
   say(`[claudelocal] starting ${boot.alias} (${boot.name}, ${human(boot.bytes)}, ${boot.source}) ...`);
   const r = await up({
@@ -207,12 +263,13 @@ async function cmdModels() {
   const st = readState();
   const ctx = sessionCtx(models);
   say();
-  say(`${models.length} local models  (source: claudelocal/models, LM Studio, ollama)`);
+  say(`${models.length} models  (claudelocal/models, LM Studio, ollama, and remotes.json)`);
   say();
   say("            alias                       size     ctx    arch        vision  where");
   for (const m of models) {
     const mark = m.alias === st.alias ? "  ->" : "    ";
-    say(`${mark} ${m.alias.padEnd(28)} ${human(m.bytes).padStart(8)} ${String(Math.min(ctx, m.nCtxTrain)).padStart(7)} ${m.arch.padEnd(11)} ${(m.mmproj ? "yes" : "-").padEnd(7)} ${m.source}`);
+    const size = isRemote(m) ? "remote" : human(m.bytes);
+    say(`${mark} ${m.alias.padEnd(28)} ${size.padStart(8)} ${String(Math.min(ctx, m.nCtxTrain)).padStart(7)} ${m.arch.padEnd(11)} ${(m.mmproj ? "yes" : "-").padEnd(7)} ${m.source}`);
   }
   say();
   say(`  session context ${ctx} - the smallest native window in this list. Every model in the picker`);
@@ -237,9 +294,87 @@ async function cmdModels() {
   say();
 }
 
+// What is configured in remotes.json, whether each one has the key it needs, and - with --check -
+// whether it actually answers. The reachability probe matters most for a tunnelled llama-server:
+// a Kaggle session hands out a new URL every time it starts, so "is this URL still alive" is the
+// question asked most often.
+async function cmdRemotes() {
+  const { models } = registry();
+  const rem = models.filter(isRemote);
+  say();
+  if (!fs.existsSync(REMOTES_FILE)) {
+    say(`No remotes configured.`);
+    say(`  Create ${REMOTES_FILE} - copy remotes.example.json beside it and edit.`);
+    say();
+    return;
+  }
+  if (!rem.length) {
+    say(`${REMOTES_FILE} has no usable entries (a disabled or malformed one is listed by 'claudelocal models').`);
+    say();
+    return;
+  }
+  say(`${rem.length} remote models  (${REMOTES_FILE})`);
+  say();
+  say("     alias                       ctx   key                     endpoint");
+  for (const m of rem) {
+    const key = remoteKey(m);
+    const ks = m.remote.apiKeyEnv ? (key ? `${m.remote.apiKeyEnv} set` : `${m.remote.apiKeyEnv} MISSING`) : (key ? "inline" : "none needed");
+    say(`     ${m.alias.padEnd(24)} ${String(m.nCtxTrain).padStart(7)}   ${ks.padEnd(26)}  ${m.remote.baseUrl}`);
+    const via = m.remote.api === "openai" ? " via the OpenAI bridge" : "";
+    say(`     ${"".padEnd(24)} ${"".padStart(7)}   ${"".padEnd(26)}  sends model id "${m.remote.model}"${via}`);
+    if (m.remote.fallback.length) {
+      say(`     ${"".padEnd(24)} ${"".padStart(7)}   ${"".padEnd(26)}  falls back to ${m.remote.fallback.join(", ")} on 429 / 5xx`);
+    }
+  }
+  if (flag("check")) {
+    say();
+    say("Probing each endpoint with a one-token request ...");
+    for (const m of rem) {
+      const key = remoteKey(m);
+      // Probing without the key the config says to use would either be rejected upstream or -
+      // worse, against an endpoint that does not enforce auth - come back "ok" and hide the fault.
+      if (!key && m.remote.apiKeyEnv) {
+        say(`  skip  ${m.alias.padEnd(24)} ${m.remote.apiKeyEnv} is not set - nothing to authenticate with`);
+        continue;
+      }
+      // The probe has to speak whatever the endpoint speaks, or an OpenAI-only provider answers
+      // 404 for a path it never published and the entry looks broken when it is fine.
+      const bridge = m.remote.api === "openai";
+      const headers = {};
+      if (bridge) { if (key) headers.authorization = `Bearer ${key}`; }
+      else {
+        headers["anthropic-version"] = "2023-06-01";
+        if (key) { headers.authorization = `Bearer ${key}`; headers["x-api-key"] = key; }
+      }
+      const url = bridge
+        ? `${m.remote.baseUrl}${m.remote.path ?? "/v1/chat/completions"}`
+        : `${m.remote.baseUrl}/v1/messages`;
+      // The one-token probe body happens to be legal under both schemas, so only the path and the
+      // auth headers differ.
+      const body = { model: m.remote.model, max_tokens: 1, messages: [{ role: "user", content: "hi" }] };
+      const t0 = Date.now();
+      const r = await httpJSON(url, { method: "POST", timeout: 60000, headers, body: JSON.stringify(body) });
+      const ms = Date.now() - t0;
+      if (r.ok) say(`  ok    ${m.alias.padEnd(24)} answered in ${ms} ms`);
+      // 429 means the endpoint is alive and the key is good - it is only saying "not right now",
+      // which for a free tier is the most likely answer to a probe fired at every entry in a row.
+      else if (r.status === 429) say(`  busy  ${m.alias.padEnd(24)} 429 rate-limited after ${ms} ms - endpoint and key are fine`);
+      else say(`  FAIL  ${m.alias.padEnd(24)} ${r.status || "no response"}  ${String(r.error ?? JSON.stringify(r.json ?? {})).slice(0, 160)}`);
+    }
+  } else {
+    say();
+    say("  claudelocal remotes --check   actually call each one and time it");
+  }
+  say();
+}
+
 async function cmdDown() {
   await proxyDown(PROXY_PORT);
   const ok = await down(PORT);
+  // `alias` means "resident right now", so unloading has to clear it or the next start would
+  // report a model that is no longer in memory - and the router would skip loading it back.
+  const st = readState();
+  if (ok) writeState({ lastAlias: st.alias ?? st.lastAlias ?? null, alias: null, model: null, modelName: null, source: null, ctx: null, kvType: null, ngl: null, nGpuLayers: null, vision: false });
   say(`[claudelocal] ${ok ? "stopped" : "stop requested (server still responding - check Task Manager)"}`);
 }
 
@@ -254,6 +389,7 @@ async function cmdStatus() {
   say(`proxy      ${px ? `up on :${PROXY_PORT}  pid ${px.pid}` : `down (:${PROXY_PORT})`}`);
   const routed = px ? await httpJSON(`http://127.0.0.1:${PROXY_PORT}/claudelocal/models`, { timeout: 2000 }) : null;
   if (routed?.json?.switching) say(`switching  ${routed.json.switching}  (a load is in flight)`);
+  if (!st.alias) say(`loaded     nothing${st.lastAlias ? `  (last used: ${st.lastAlias} - pick it in /model to load it)` : ""}`);
   if (st.alias) say(`loaded     ${st.alias}${st.source ? `  from ${st.source}` : ""}${st.vision ? "  vision on" : ""}`);
   if (st.modelName) say(`model      ${st.modelName}  ctx ${st.ctx}  KV ${st.kvType}  ngl ${st.ngl}  strategy ${st.strategy}${st.mtp ? "  MTP on" : ""}`);
   // The router resolves any model on the machine, while the picker only offers those that clear
@@ -373,10 +509,11 @@ function cmdHelp() {
   say(`
 claudelocal - Claude Code on any local model on this machine
 
-  claudelocal                    start everything and open Claude Code
+  claudelocal                    open Claude Code with no model loaded - /model loads one
   claudelocal -p "..."           any normal claude argument passes straight through
 
-  claudelocal models             every local model found, and what /model will offer
+  claudelocal models             every model found - local and remote - and what /model offers
+  claudelocal remotes            remote models, their keys, and (--check) whether they answer
   claudelocal --model <alias>    load a specific one
   claudelocal plan               show the memory plan and the context/speed trade-off table
   claudelocal up                 load the model only (no Claude Code)
@@ -390,6 +527,7 @@ claudelocal - Claude Code on any local model on this machine
 
 Options
   --model ALIAS      which local model to load (default: the last one used)
+  --no-load          bring the proxy up but load no model; /model does the loading
   --min-ctx N        leave models with a smaller native window out of the picker, which
                      raises the session context every model has to share (default 16384)
   --rescan           re-read every GGUF header instead of trusting models.json
@@ -409,7 +547,7 @@ const table = {
   plan: cmdPlan, up: cmdUp, down: cmdDown, stop: cmdDown, status: cmdStatus,
   doctor: cmdDoctor, bench: cmdBench, tune: cmdTune, pull: cmdPull,
   install: cmdInstall, help: cmdHelp,
-  models: cmdModels, settings: cmdSettings,
+  models: cmdModels, settings: cmdSettings, remotes: cmdRemotes,
 };
 
 const fn = table[cmd];

@@ -18,6 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { readGGUF, archInfo } from "./gguf.mjs";
+import { discoverRemotes } from "./remotes.mjs";
 import { paths, readJSON, GiB, MiB } from "./sys.mjs";
 
 // What Claude Code sends before the conversation has started at all: system prompt, tool
@@ -187,6 +188,11 @@ function quantOf(file) {
 
 const HUMAN = (b) => (b >= GiB ? `${(b / GiB).toFixed(1)} GB` : `${Math.round(b / MiB)} MB`);
 
+// Just the host, for describing a remote in a picker row that has no room for a full URL.
+function hostOf(url) {
+  try { return new URL(url).host; } catch { return String(url ?? "remote"); }
+}
+
 // --- inspection ---------------------------------------------------------------------------------
 // Everything that has to be read out of the file itself. Cached by size+mtime.
 function probe(file) {
@@ -271,6 +277,21 @@ export function discover({ refresh = false, minCtx = MIN_CTX } = {}) {
     });
   }
 
+  // Models that are not on this machine at all. They join the same list because everything
+  // downstream - the picker, the router, `claudelocal models` - should not care where a model runs,
+  // only that the alias resolves. They are held to the same context floor as a local model: the
+  // session window is the smallest in the picker, so a remote configured with a small one would
+  // quietly drag every local model down with it.
+  const remote = discoverRemotes();
+  for (const r of remote.models) {
+    if (r.nCtxTrain < minCtx) {
+      skipped.push({ ...r, reason: `configured context ${r.nCtxTrain} is below the ${minCtx} floor (--min-ctx to lower it)` });
+      continue;
+    }
+    models.push(r);
+  }
+  skipped.push(...remote.skipped);
+
   // Two managers holding the same model, or two quants of one model, collide on a single alias -
   // and an alias that resolves to two different files is worse than an ugly one. Bigger first, so
   // when the same model exists twice the better copy keeps the clean name.
@@ -320,7 +341,9 @@ export function pickerRows(models, { ctxOf, includeAuto = true } = {}) {
     const bits = [
       m.sizeLabel ?? null,
       m.quant,
-      `${HUMAN(m.bytes)} on disk`,
+      // A remote weighs nothing here and "0 MB on disk" would be actively misleading, so it says
+      // where it runs instead - which is the thing worth knowing before picking it.
+      m.source === "remote" ? `hosted at ${hostOf(m.ref)}` : `${HUMAN(m.bytes)} on disk`,
       `${Math.round(ctx / 1024)}k ctx`,
       m.source,
     ].filter(Boolean);

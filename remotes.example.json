@@ -1,0 +1,133 @@
+{
+  "//": [
+    "Models that are not on this machine. Copy this file to remotes.json and edit.",
+    "",
+    "Each key is the alias shown in /model. Fields:",
+    "  baseUrl    required. The API root, WITHOUT the path (no /v1/messages, no /v1/chat/completions).",
+    "  api        \"anthropic\" (default) or \"openai\". Anthropic is passed straight through; openai",
+    "             is translated in both directions by src/openai.mjs, which is what makes a",
+    "             Chat-Completions-only provider such as build.nvidia.com usable from Claude Code.",
+    "  model      the model id sent upstream. Defaults to the alias.",
+    "  apiKey     a literal key. Prefer apiKeyEnv unless the file is safe to hold it.",
+    "  apiKeyEnv  name of an environment variable holding the key.",
+    "  ctx        the window to advertise. The session uses the SMALLEST in the picker,",
+    "             so a small number here drags every local model down with it.",
+    "  enabled    set false to keep an entry configured but out of the picker.",
+    "  label      display name in the picker. Defaults to the alias.",
+    "  maxOutput  clamp max_tokens. Omit for hosted models - they are fast enough not to need it.",
+    "  fallback   alias, or list of aliases, to try when this one answers 429 or 5xx or refuses the",
+    "             connection. Chains follow: a fallback's own fallback is tried after it. A hop is",
+    "             only retried while nothing of the answer has reached Claude Code yet. Once the whole",
+    "             chain is exhausted the proxy walks it again a few times with backoff, so a rate",
+    "             limit measured over a window resolves itself instead of failing the turn.",
+    "  extra      body fields merged in after translation (openai only): reasoning_effort, seed, ...",
+    "  reasoning  what to do with reasoning_content (openai only): \"think\" (default) makes a real",
+    "             Anthropic thinking block, \"text\" folds it into the answer, \"drop\" discards it.",
+    "  path       override the upstream path (openai only). Default /v1/chat/completions.",
+    "",
+    "remotes.json is gitignored, because it may hold a key."
+  ],
+  "kimi-k3-nvidia": {
+    "label": "Kimi K3 (NVIDIA NIM)",
+    "baseUrl": "https://integrate.api.nvidia.com",
+    "api": "openai",
+    "model": "moonshotai/kimi-k3",
+    "apiKeyEnv": "NVIDIA_API_KEY",
+    "ctx": 262144,
+    "maxOutput": 16384,
+    "sizeLabel": "2.8T-A104B",
+    "extra": {
+      "reasoning_effort": "max"
+    },
+    "fallback": [
+      "kimi-k3-nvidia-fallback1"
+    ],
+    "enabled": false,
+    "note": "build.nvidia.com is OpenAI Chat Completions only, so this entry needs api:\"openai\". One key allows about one request in flight; Claude Code fires side-requests alongside the main turn, so a second key is what keeps a session from stalling on 429."
+  },
+  "kimi-k3-nvidia-fallback1": {
+    "label": "Kimi K3 (NVIDIA NIM, key 2)",
+    "baseUrl": "https://integrate.api.nvidia.com",
+    "api": "openai",
+    "model": "moonshotai/kimi-k3",
+    "apiKeyEnv": "NVIDIA_API_KEY_2",
+    "ctx": 262144,
+    "maxOutput": 16384,
+    "extra": {
+      "reasoning_effort": "max"
+    },
+    "enabled": false,
+    "note": "Same endpoint and model, different key. It shows in /model on its own AND backs the entry above. Each key points at the NEXT one rather than the primary listing them all, so adding a key is one edit.",
+    "fallback": [
+      "kimi-k3-nvidia-fallback2"
+    ]
+  },
+  "kimi-k3-nvidia-fallback2": {
+    "label": "Kimi K3 (NVIDIA NIM, key 3)",
+    "baseUrl": "https://integrate.api.nvidia.com",
+    "api": "openai",
+    "model": "moonshotai/kimi-k3",
+    "apiKeyEnv": "NVIDIA_API_KEY_3",
+    "ctx": 262144,
+    "maxOutput": 16384,
+    "extra": {
+      "reasoning_effort": "max"
+    },
+    "enabled": false,
+    "note": "End of the chain. Free-tier quota is per key and measured over a window, so three keys is roughly three times the budget - not just three times the concurrency."
+  },
+  "qwen3.8-27b-tpu": {
+    "label": "Qwen3.8-27B bf16 (Kaggle TPU v5e-8)",
+    "baseUrl": "https://REPLACE-ME.trycloudflare.com",
+    "model": "qwen3.8-27b",
+    "apiKey": "sk-REPLACE-ME",
+    "authStyle": "bearer",
+    "ctx": 262144,
+    "enabled": false,
+    "note": "python launch.py serve  in ~/Projects/kaggle-tpu-lab prints the URL and key. Bearer ONLY - this server rejects x-api-key, hence authStyle. Full bf16 weights, no quantization, ~130 tok/s."
+  },
+  "qwen3.8-27b-kaggle": {
+    "label": "Qwen3.8-27B (Kaggle T4x2)",
+    "baseUrl": "https://REPLACE-ME.trycloudflare.com",
+    "model": "qwen3.8-27b",
+    "apiKey": "sk-cl-REPLACE-ME",
+    "ctx": 131072,
+    "enabled": false,
+    "note": "Printed by kaggle/claudelocal-kaggle.ipynb. New URL and key every session."
+  },
+  "glm-4.7-flash-kaggle": {
+    "label": "GLM-4.7-Flash (Kaggle T4x2)",
+    "baseUrl": "https://REPLACE-ME.trycloudflare.com",
+    "model": "glm-4.7-flash",
+    "apiKey": "sk-cl-REPLACE-ME",
+    "ctx": 131072,
+    "enabled": false,
+    "note": "Same tunnel as the Qwen entry - llama-swap routes on the model id."
+  },
+  "glm-5.3": {
+    "label": "GLM-5.3 (Z.ai)",
+    "baseUrl": "https://api.z.ai/api/anthropic",
+    "model": "glm-5.3",
+    "apiKeyEnv": "ZAI_API_KEY",
+    "ctx": 200000,
+    "enabled": false,
+    "note": "744B-A40B. Far too large to run locally at any quantization - this is the hosted model."
+  },
+  "kimi-k3": {
+    "label": "Kimi K3 (Moonshot)",
+    "baseUrl": "https://api.moonshot.ai/anthropic",
+    "model": "kimi-k3",
+    "apiKeyEnv": "MOONSHOT_API_KEY",
+    "ctx": 262144,
+    "enabled": false,
+    "note": "2.8T-A104B. Its 1-bit dynamic GGUF is 594 GB, so hosted is the only option."
+  },
+  "lan-box": {
+    "label": "llama-server on the LAN",
+    "baseUrl": "http://192.168.1.50:8080",
+    "model": "whatever-alias-it-was-started-with",
+    "ctx": 131072,
+    "enabled": false,
+    "note": "No key needed on a trusted network - omit apiKey and apiKeyEnv entirely."
+  }
+}

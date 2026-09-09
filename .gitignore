@@ -13,3 +13,7 @@ state.json
 models.json
 
 node_modules/
+remotes.json
+
+# Backups of remotes.json - same secrets, same reason to stay out of git.
+remotes.json.bak*
