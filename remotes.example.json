@@ -27,6 +27,19 @@
     "",
     "remotes.json is gitignored, because it may hold a key."
   ],
+  "opus-5": {
+    "label": "Claude Opus 5 (your subscription)",
+    "baseUrl": "https://api.anthropic.com",
+    "model": "claude-opus-5",
+    "auth": "claude-subscription",
+    "ctx": 200000,
+    "maxOutput": 32000,
+    "enabled": true,
+    "fallback": [
+      "sonnet-5"
+    ],
+    "note": "No key: \"auth\": \"claude-subscription\" reads the OAuth token from Claude Code's own credential store at call time. Run 'claude' once if it has expired. Copy this block for sonnet-5 (claude-sonnet-5) and haiku-4.5 (claude-haiku-4-5-20251001)."
+  },
   "kimi-k3-nvidia": {
     "label": "Kimi K3 (NVIDIA NIM)",
     "baseUrl": "https://integrate.api.nvidia.com",

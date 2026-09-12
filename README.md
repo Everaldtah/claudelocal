@@ -546,6 +546,62 @@ so GLM there would mean building a 58 GB weights dataset and a serve script agai
 vllm-tpu support for its MoE architecture. The TPU is the one-model, no-quantization, fast option;
 the T4 x2 notebook is the two-model, swappable one.
 
+## Your Claude subscription, in the same picker
+
+The models on your Claude plan sit in `/model` alongside the local GGUFs, so a turn can move from a
+7 B model on this card to Opus and back without leaving the session:
+
+```
+opus-5        Claude Opus 5 (your subscription)
+sonnet-5      Claude Sonnet 5 (your subscription)
+haiku-4.5     Claude Haiku 4.5 (your subscription)
+```
+
+These entries hold **no key**. A subscription is not an API key: Claude Code signs in over OAuth and
+keeps a short-lived token in its own credential store, so the entry names an auth source instead and
+the token is read per request.
+
+```json
+{
+  "opus-5": {
+    "label": "Claude Opus 5 (your subscription)",
+    "baseUrl": "https://api.anthropic.com",
+    "model": "claude-opus-5",
+    "auth": "claude-subscription",
+    "ctx": 200000,
+    "maxOutput": 32000,
+    "fallback": ["sonnet-5"]
+  }
+}
+```
+
+Read at call time and never cached, for three reasons: the access token rotates hourly and a value
+captured at startup would be stale; `remotes.json` is a config file that gets pasted into issues;
+and a session that has been logged out should start failing immediately rather than keep working off
+a token this process happened to be holding.
+
+**Nothing here refreshes the token.** Refreshing spends the refresh token, and losing that race with
+Claude Code's own refresh would log you out of your editor — a far worse failure than the error this
+prints instead. Run `claude` once and the token is fresh again. `claudelocal --cl-remotes` shows how
+long the current one has left.
+
+Two details the API enforces, both handled in `src/subscription.mjs` and the proxy:
+
+- a subscription token is a **bearer** token, and the API rejects it in `x-api-key`;
+- the request must ask for the OAuth beta, which is appended to whatever `anthropic-beta` header
+  arrived rather than replacing it, since replacing it would cost prompt caching.
+
+Subscription turns count against your plan's limits exactly like any other Claude Code session, and
+`opus-5` falls over to `sonnet-5` and then `haiku-4.5` when a limit is hit.
+
+Not every model on the account is necessarily on the plan. `fable-5.1` is configured and disabled:
+probed 2026-09-12 it answered `429 credits_required`, so it is left out of the picker rather than
+sitting there as an option that always fails.
+
+One thing to know: the session window is the **smallest** context in the picker, so a 200k
+subscription model shares whatever a small local GGUF pinned it to. `claudelocal --cl-min-ctx 200000`
+drops the small models and gives the rest their real window.
+
 ## Commands
 
 ```

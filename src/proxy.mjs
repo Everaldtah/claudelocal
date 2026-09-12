@@ -32,6 +32,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { discover, resolve as resolveModel, AUTO_ALIAS } from "./registry.mjs";
 import { isRemote, remoteKey } from "./remotes.mjs";
+import { SUBSCRIPTION_AUTH, OAUTH_BETA, subscriptionToken } from "./subscription.mjs";
 import { toOpenAIRequest, toAnthropicResponse, streamTranslator, estimateTokens } from "./openai.mjs";
 import { ensureModel } from "./serve.mjs";
 import { readState, writeState } from "./sys.mjs";
@@ -460,6 +461,11 @@ const server = http.createServer((req, res) => {
         const key = remoteKey(entry);
         // A tunnelled llama-server needs no key at all, so a missing one is only an error when the
         // config said where to find it.
+        if (!key && r.auth === SUBSCRIPTION_AUTH) {
+          // The subscription is the one credential this proxy cannot repair on its own: refreshing
+          // the token is Claude Code's job, and racing it would log the user out of their editor.
+          return failStream(`claudelocal: ${entry.alias} runs on your Claude subscription and there is no usable token - ${subscriptionToken().reason}`);
+        }
         if (!key && r.apiKeyEnv) {
           return failStream(`claudelocal: ${entry.alias} needs an API key - set ${r.apiKeyEnv}, or put "apiKey" in remotes.json`);
         }
@@ -483,6 +489,14 @@ const server = http.createServer((req, res) => {
           // request that arrived without it must still be valid upstream.
           h["anthropic-version"] = req.headers["anthropic-version"] ?? "2023-06-01";
           if (req.headers["anthropic-beta"]) h["anthropic-beta"] = req.headers["anthropic-beta"];
+          if (r.auth === SUBSCRIPTION_AUTH) {
+            // Anthropic's API only accepts a subscription OAuth token when the caller asks for the
+            // OAuth beta. Claude Code already sends the header, so this appends rather than
+            // replaces - dropping whatever else it listed would cost prompt caching.
+            const betas = String(h["anthropic-beta"] ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+            if (!betas.includes(OAUTH_BETA)) betas.push(OAUTH_BETA);
+            h["anthropic-beta"] = betas.join(",");
+          }
         }
         if (key) {
           // Anthropic's own API authenticates with `x-api-key`; Z.ai, Moonshot and every OpenAI

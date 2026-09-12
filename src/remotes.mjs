@@ -18,6 +18,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { paths, readJSON } from "./sys.mjs";
+import { SUBSCRIPTION_AUTH, subscriptionToken } from "./subscription.mjs";
 
 const CONFIG = path.join(paths.root, "remotes.json");
 export const REMOTES_FILE = CONFIG;
@@ -33,7 +34,10 @@ const DEFAULT_CTX = 200000;
 // the registry, the planner and the picker all key off these fields, so a remote has to present
 // the same shape as a local model or every consumer needs a special case.
 function shape(alias, r) {
-  const key = r.apiKey ?? (r.apiKeyEnv ? process.env[r.apiKeyEnv] : null) ?? null;
+  // A subscription entry carries no key in the file at all - the token lives in Claude Code's own
+  // credential store and is read per request, so `key` stays null here on purpose.
+  const sub = r.auth === SUBSCRIPTION_AUTH;
+  const key = sub ? null : (r.apiKey ?? (r.apiKeyEnv ? process.env[r.apiKeyEnv] : null) ?? null);
   return {
     alias,
     source: "remote",
@@ -52,7 +56,10 @@ function shape(alias, r) {
       baseUrl: String(r.baseUrl).replace(/\/+$/, ""),
       model: r.model ?? alias,
       apiKey: key,
-      apiKeyEnv: r.apiKeyEnv ?? null,
+      apiKeyEnv: sub ? null : (r.apiKeyEnv ?? null),
+      // "claude-subscription" means: authenticate as the signed-in Claude subscription, with the
+      // OAuth token read from disk at call time. Anything else authenticates with a key.
+      auth: sub ? SUBSCRIPTION_AUTH : null,
       // "anthropic" is passthrough. "openai" routes the turn through the translator in openai.mjs,
       // which is what makes NVIDIA's build.nvidia.com catalog - Chat Completions only - usable here.
       api: r.api === "openai" ? "openai" : "anthropic",
@@ -71,7 +78,9 @@ function shape(alias, r) {
               : typeof r.fallback === "string" ? [r.fallback] : [],
       // Anthropic's own API authenticates with `x-api-key`; Z.ai and Moonshot document a bearer
       // token. Sending both satisfies every one of them and no provider rejects the spare header.
-      authStyle: r.authStyle ?? "both",
+      // A subscription token is a bearer token and the API rejects it in `x-api-key`, so the
+      // config does not get a say in how it is presented.
+      authStyle: sub ? "bearer" : (r.authStyle ?? "both"),
       headers: r.headers ?? {},
       // A hosted model answers in seconds, so the local 8192-token output clamp - which exists
       // because a CPU-offloaded 27B would take an hour to fill a large one - is pointless here.
@@ -119,7 +128,18 @@ export function discoverRemotes() {
 export function remoteKey(entry) {
   const r = entry?.remote;
   if (!r) return null;
+  // The subscription token rotates hourly, so it is fetched per call and never held anywhere.
+  if (r.auth === SUBSCRIPTION_AUTH) return subscriptionToken().token;
   return r.apiKey ?? (r.apiKeyEnv ? process.env[r.apiKeyEnv] ?? null : null);
+}
+
+/** Why a remote has no usable credential right now, or null when it has one. */
+export function remoteKeyProblem(entry) {
+  const r = entry?.remote;
+  if (!r) return null;
+  if (r.auth === SUBSCRIPTION_AUTH) return subscriptionToken().reason;
+  if (!remoteKey(entry) && r.apiKeyEnv) return `${r.apiKeyEnv} is not set`;
+  return null;
 }
 
 export const isRemote = (m) => m?.source === "remote" && !!m.remote;

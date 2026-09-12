@@ -8,7 +8,8 @@ import { inspect, plan, explain, ladder, serverArgs } from "./plan.mjs";
 import { up, down, health, findModel, findMmproj, serverExe, guardStatus, tailLog, DEFAULT_PORT, DEFAULT_PROXY_PORT } from "./serve.mjs";
 import { PROXY_VERSION } from "./proxy.mjs";
 import { discover, resolve as resolveModel, pickerRows, human, AUTO_ALIAS, MIN_CTX, CLAUDE_CODE_BASE_TOKENS } from "./registry.mjs";
-import { isRemote, remoteKey, REMOTES_FILE } from "./remotes.mjs";
+import { isRemote, remoteKey, remoteKeyProblem, REMOTES_FILE } from "./remotes.mjs";
+import { SUBSCRIPTION_AUTH, OAUTH_BETA, subscriptionStatus } from "./subscription.mjs";
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] ?? "help";
@@ -326,10 +327,17 @@ async function cmdRemotes() {
   say("     alias                       ctx   key                     endpoint");
   for (const m of rem) {
     const key = remoteKey(m);
-    const ks = m.remote.apiKeyEnv ? (key ? `${m.remote.apiKeyEnv} set` : `${m.remote.apiKeyEnv} MISSING`) : (key ? "inline" : "none needed");
+    const sub = m.remote.auth === SUBSCRIPTION_AUTH;
+    const ks = sub ? (key ? "subscription" : "subscription NOT SIGNED IN")
+             : m.remote.apiKeyEnv ? (key ? `${m.remote.apiKeyEnv} set` : `${m.remote.apiKeyEnv} MISSING`)
+             : (key ? "inline" : "none needed");
     say(`     ${m.alias.padEnd(24)} ${String(m.nCtxTrain).padStart(7)}   ${ks.padEnd(26)}  ${m.remote.baseUrl}`);
     const via = m.remote.api === "openai" ? " via the OpenAI bridge" : "";
     say(`     ${"".padEnd(24)} ${"".padStart(7)}   ${"".padEnd(26)}  sends model id "${m.remote.model}"${via}`);
+    if (sub) {
+      const st = subscriptionStatus();
+      say(`     ${"".padEnd(24)} ${"".padStart(7)}   ${"".padEnd(26)}  your Claude subscription: ${st.detail}`);
+    }
     if (m.remote.fallback.length) {
       say(`     ${"".padEnd(24)} ${"".padStart(7)}   ${"".padEnd(26)}  falls back to ${m.remote.fallback.join(", ")} on 429 / 5xx`);
     }
@@ -341,8 +349,9 @@ async function cmdRemotes() {
       const key = remoteKey(m);
       // Probing without the key the config says to use would either be rejected upstream or -
       // worse, against an endpoint that does not enforce auth - come back "ok" and hide the fault.
-      if (!key && m.remote.apiKeyEnv) {
-        say(`  skip  ${m.alias.padEnd(24)} ${m.remote.apiKeyEnv} is not set - nothing to authenticate with`);
+      const problem = remoteKeyProblem(m);
+      if (!key && problem) {
+        say(`  skip  ${m.alias.padEnd(24)} ${problem}`);
         continue;
       }
       // The probe has to speak whatever the endpoint speaks, or an OpenAI-only provider answers
@@ -350,6 +359,12 @@ async function cmdRemotes() {
       const bridge = m.remote.api === "openai";
       const headers = {};
       if (bridge) { if (key) headers.authorization = `Bearer ${key}`; }
+      else if (m.remote.auth === SUBSCRIPTION_AUTH) {
+        // Bearer only, plus the OAuth beta: the API rejects a subscription token in `x-api-key`.
+        headers["anthropic-version"] = "2023-06-01";
+        headers["anthropic-beta"] = OAUTH_BETA;
+        headers.authorization = `Bearer ${key}`;
+      }
       else {
         headers["anthropic-version"] = "2023-06-01";
         if (key) { headers.authorization = `Bearer ${key}`; headers["x-api-key"] = key; }
