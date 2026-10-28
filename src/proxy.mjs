@@ -33,6 +33,8 @@ import { fileURLToPath } from "node:url";
 import { discover, resolve as resolveModel, AUTO_ALIAS } from "./registry.mjs";
 import { isRemote, remoteKey } from "./remotes.mjs";
 import { SUBSCRIPTION_AUTH, OAUTH_BETA, subscriptionToken } from "./subscription.mjs";
+import { isCodexSubscription } from "./codex-subscription.mjs";
+import { codexRequest } from "./responses.mjs";
 import { toOpenAIRequest, toAnthropicResponse, streamTranslator, estimateTokens } from "./openai.mjs";
 import { ensureModel } from "./serve.mjs";
 import { readState, writeState } from "./sys.mjs";
@@ -49,7 +51,7 @@ const CTX_CAP = parseInt(opt("ctx", process.env.CLAUDELOCAL_CTX || "0"), 10);
 const LOG = path.join(path.dirname(path.dirname(fileURLToPath(import.meta.url))), "logs", "proxy.log");
 
 // Bump when the rewriting rules change: `claudelocal up` replaces a proxy reporting an older one.
-export const PROXY_VERSION = 10;
+export const PROXY_VERSION = 11;
 
 // The registry is read from models.json, so this is cheap; it is re-read when a request names a
 // model we do not recognise, which is how a model downloaded mid-session becomes switchable
@@ -361,7 +363,31 @@ const server = http.createServer((req, res) => {
     // A remote whose provider only speaks Chat Completions has no token-counting verb to forward
     // this to. The number only drives a progress meter, so it is estimated here rather than being
     // sent somewhere that would answer 404 and leave Claude Code retrying.
-    if (route && route.remote.api === "openai" && /count_tokens/.test(url)) return countTokensReply();
+    if (route && ["openai", "responses"].includes(route.remote.api) && /count_tokens/.test(url)) return countTokensReply();
+
+    if (isCodexSubscription(route)) {
+      if (!parsed) return failStream("Codex expects an Anthropic Messages request", 400);
+      const ac = new AbortController();
+      res.on("close", () => { if (!res.writableFinished) ac.abort(); stopPings(); });
+      const timer = isStream ? setTimeout(beginStream, PRE_HEADER_MS) : null;
+      try {
+        const result = await codexRequest(parsed, route.remote, {
+          signal: ac.signal,
+          onChunk: isStream ? (chunk) => { beginStream(); touch(); res.write(chunk); } : undefined,
+        });
+        clearTimeout(timer);
+        stopPings();
+        if (res.destroyed) return;
+        if (isStream) return res.end();
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify(result));
+      } catch (error) {
+        clearTimeout(timer);
+        stopPings();
+        if (res.destroyed) return;
+        return failStream(`claudelocal: ${error.message}`, error.status ?? 502);
+      }
+    }
 
     // --- the fallback chain ----------------------------------------------------------------------
     // A remote may name fallbacks: sibling entries pointing at the same provider under a different

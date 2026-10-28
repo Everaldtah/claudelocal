@@ -10,6 +10,8 @@ import { PROXY_VERSION } from "./proxy.mjs";
 import { discover, resolve as resolveModel, pickerRows, human, AUTO_ALIAS, MIN_CTX, CLAUDE_CODE_BASE_TOKENS } from "./registry.mjs";
 import { isRemote, remoteKey, remoteKeyProblem, REMOTES_FILE } from "./remotes.mjs";
 import { SUBSCRIPTION_AUTH, OAUTH_BETA, subscriptionStatus } from "./subscription.mjs";
+import { CODEX_SUBSCRIPTION_AUTH, CODEX_API, codexModels, codexSubscriptionStatus, isCodexSubscription } from "./codex-subscription.mjs";
+import { codexRequest } from "./responses.mjs";
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] ?? "help";
@@ -309,7 +311,8 @@ async function cmdModels() {
 // question asked most often.
 async function cmdRemotes() {
   const { models } = registry();
-  const rem = models.filter(isRemote);
+  const requested = opt("model", null);
+  const rem = models.filter(m => isRemote(m) && (!requested || m.alias === requested));
   say();
   if (!fs.existsSync(REMOTES_FILE)) {
     say(`No remotes configured.`);
@@ -327,16 +330,17 @@ async function cmdRemotes() {
   say("     alias                       ctx   key                     endpoint");
   for (const m of rem) {
     const key = remoteKey(m);
-    const sub = m.remote.auth === SUBSCRIPTION_AUTH;
+    const codex = isCodexSubscription(m);
+    const sub = m.remote.auth === SUBSCRIPTION_AUTH || codex;
     const ks = sub ? (key ? "subscription" : "subscription NOT SIGNED IN")
              : m.remote.apiKeyEnv ? (key ? `${m.remote.apiKeyEnv} set` : `${m.remote.apiKeyEnv} MISSING`)
              : (key ? "inline" : "none needed");
     say(`     ${m.alias.padEnd(24)} ${String(m.nCtxTrain).padStart(7)}   ${ks.padEnd(26)}  ${m.remote.baseUrl}`);
-    const via = m.remote.api === "openai" ? " via the OpenAI bridge" : "";
+    const via = codex ? " via Codex Responses (ChatGPT plan)" : m.remote.api === "openai" ? " via the OpenAI bridge" : "";
     say(`     ${"".padEnd(24)} ${"".padStart(7)}   ${"".padEnd(26)}  sends model id "${m.remote.model}"${via}`);
     if (sub) {
-      const st = subscriptionStatus();
-      say(`     ${"".padEnd(24)} ${"".padStart(7)}   ${"".padEnd(26)}  your Claude subscription: ${st.detail}`);
+      const st = codex ? codexSubscriptionStatus() : subscriptionStatus();
+      say(`     ${"".padEnd(24)} ${"".padStart(7)}   ${"".padEnd(26)}  ${st.detail}`);
     }
     if (m.remote.fallback.length) {
       say(`     ${"".padEnd(24)} ${"".padStart(7)}   ${"".padEnd(26)}  falls back to ${m.remote.fallback.join(", ")} on 429 / 5xx`);
@@ -344,8 +348,16 @@ async function cmdRemotes() {
   }
   if (flag("check")) {
     say();
-    say("Probing each endpoint with a one-token request ...");
+    say("Probing each endpoint with a minimal request (uses model allowance) ...");
     for (const m of rem) {
+      if (isCodexSubscription(m)) {
+        const started = Date.now();
+        try {
+          const reply = await codexRequest({ model: m.alias, messages: [{ role: "user", content: "Reply only OK." }] }, m.remote, { signal: AbortSignal.timeout(60000) });
+          say(`  ok    ${m.alias.padEnd(24)} answered in ${Date.now() - started} ms: ${reply.content.filter(c => c.type === "text").map(c => c.text).join("").slice(0, 80)}`);
+        } catch (error) { process.exitCode = 1; say(`  FAIL  ${m.alias} ${error.message}`); }
+        continue;
+      }
       const key = remoteKey(m);
       // Probing without the key the config says to use would either be rejected upstream or -
       // worse, against an endpoint that does not enforce auth - come back "ok" and hide the fault.
@@ -389,6 +401,33 @@ async function cmdRemotes() {
     say("  claudelocal remotes --check   actually call each one and time it");
   }
   say();
+}
+
+async function cmdCodexSync() {
+  const catalog = await codexModels();
+  if (!catalog.length) throw new Error("No visible Codex models returned; configuration unchanged");
+  const original = fs.existsSync(REMOTES_FILE) ? fs.readFileSync(REMOTES_FILE, "utf8") : "{}";
+  const config = JSON.parse(original.replace(/^\uFEFF/, ""));
+  const entries = config.remotes ?? config;
+  for (const entry of Object.values(entries)) {
+    if (isCodexSubscription(entry)) entry.enabled = false;
+  }
+  for (const model of catalog) {
+    const alias = `codex-${model.slug}`;
+    if (entries[alias] && !isCodexSubscription(entries[alias])) throw new Error(`Alias ${alias} already belongs to another provider`);
+    entries[alias] = { ...entries[alias], auth: CODEX_SUBSCRIPTION_AUTH, api: "responses",
+      baseUrl: CODEX_API, model: model.slug, label: `${model.display_name} (ChatGPT subscription)`,
+      ctx: model.context_window ?? 200000, enabled: true };
+    delete entries[alias].apiKey;
+    delete entries[alias].headers;
+    delete entries[alias].apiKeyEnv;
+    delete entries[alias].path;
+  }
+  if (fs.existsSync(REMOTES_FILE)) fs.copyFileSync(REMOTES_FILE, `${REMOTES_FILE}.bak-${Date.now()}`);
+  fs.writeFileSync(REMOTES_FILE, JSON.stringify(config, null, 2) + "\n");
+  say(`Added/refreshed ${catalog.length} ChatGPT subscription models:`);
+  for (const model of catalog) say(`  codex-${model.slug}`);
+  say("Start: claudelocal --cl-model codex-" + catalog[0].slug);
 }
 
 async function cmdDown() {
@@ -537,6 +576,7 @@ claudelocal - Claude Code on any local model on this machine
 
   claudelocal models             every model found - local and remote - and what /model offers
   claudelocal remotes            remote models, their keys, and (--check) whether they answer
+  claudelocal codex-sync         refresh the models available through your ChatGPT sign-in
   claudelocal --model <alias>    load a specific one
   claudelocal plan               show the memory plan and the context/speed trade-off table
   claudelocal up                 load the model only (no Claude Code)
@@ -570,7 +610,7 @@ const table = {
   plan: cmdPlan, up: cmdUp, down: cmdDown, stop: cmdDown, status: cmdStatus,
   doctor: cmdDoctor, bench: cmdBench, tune: cmdTune, pull: cmdPull,
   install: cmdInstall, help: cmdHelp,
-  models: cmdModels, settings: cmdSettings, remotes: cmdRemotes,
+  models: cmdModels, settings: cmdSettings, remotes: cmdRemotes, "codex-sync": cmdCodexSync,
 };
 
 const fn = table[cmd];

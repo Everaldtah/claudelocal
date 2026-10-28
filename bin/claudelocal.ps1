@@ -26,6 +26,7 @@ function Show-Help {
     Write-Host ''
     Write-Host '  claudelocal --cl-models     every model found, and what /model will offer'
     Write-Host '  claudelocal --cl-remotes    remote models from remotes.json (--cl-check to call them)'
+    Write-Host '  claudelocal --cl-codex-sync refresh ChatGPT subscription models from your Codex login'
     Write-Host '  claudelocal --cl-model A    load a specific model by alias at startup'
     Write-Host '  claudelocal --cl-load       load the last-used model at startup, as it used to'
     Write-Host '  claudelocal --cl-min-ctx N  drop models below N tokens, raising the shared window'
@@ -62,6 +63,7 @@ for ($i = 0; $i -lt $list.Count; $i++) {
     switch ($list[$i]) {
         '--cl-models'   { $subcmd = 'models' }
         '--cl-remotes'  { $subcmd = 'remotes' }
+        '--cl-codex-sync' { $subcmd = 'codex-sync' }
         '--cl-check'    { $upArgs += '--check' }
         '--cl-model'    { $i++; $upArgs += @('--model', $list[$i]); $preload = $true }
         '--cl-load'     { $preload = $true }

@@ -1,5 +1,36 @@
 # claudelocal
 
+## ChatGPT subscription / Codex models
+
+Sign in with ChatGPT using `codex login`, then run:
+
+```powershell
+claudelocal --cl-codex-sync
+claudelocal --cl-model codex-gpt-6.1-sol
+```
+
+Inside Claude Code, `/model` lists the visible Codex models alongside your other models.
+`--cl-codex-sync` reads the account's current catalog and updates only the Codex entries,
+backing up `remotes.json` first. Catalog visibility does not guarantee access; verify a model with:
+
+```powershell
+claudelocal --cl-remotes --cl-model codex-gpt-6.1-sol --cl-check
+```
+
+Claude Code runs the tools and provides the interface; OpenAI models generate the responses using
+your ChatGPT plan allowance. No OpenAI API key is required. The adapter reads your existing Codex
+credentials at request time and sends them only to the fixed Codex service. Credentials are never
+copied into model configuration. If the token expires, open Codex to refresh it or run `codex login`.
+Codex remains responsible for refreshing its credentials; this adapter never spends a refresh token.
+
+The bridge translates text, images and function tools to Responses and translates the streamed
+answer back to Anthropic Messages, including non-streaming clients. Anthropic-hosted tools and
+extended-thinking blocks are not forwarded. Token counts before generation are estimates; completed
+turns use the provider's usage. Subscription requests always stream upstream with storage disabled.
+The Codex service route is an implementation detail of the installed CLI and may change.
+
+Offline protocol checks: `node --test test/*.test.mjs`.
+
 Claude Code, running against **any local model on this machine** — switchable from `/model` without
 restarting — on a 6 GB RTX 3050 and 32 GB of RAM, without freezing the desktop.
 

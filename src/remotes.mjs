@@ -19,6 +19,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { paths, readJSON } from "./sys.mjs";
 import { SUBSCRIPTION_AUTH, subscriptionToken } from "./subscription.mjs";
+import { CODEX_SUBSCRIPTION_AUTH, CODEX_API, codexSubscriptionToken } from "./codex-subscription.mjs";
 
 const CONFIG = path.join(paths.root, "remotes.json");
 export const REMOTES_FILE = CONFIG;
@@ -34,14 +35,16 @@ const DEFAULT_CTX = 200000;
 // the registry, the planner and the picker all key off these fields, so a remote has to present
 // the same shape as a local model or every consumer needs a special case.
 function shape(alias, r) {
-  // A subscription entry carries no key in the file at all - the token lives in Claude Code's own
-  // credential store and is read per request, so `key` stays null here on purpose.
+  // A subscription entry carries no key in the file at all - the token lives in the respective
+  // CLI's credential store and is read per request, so `key` stays null here on purpose.
   const sub = r.auth === SUBSCRIPTION_AUTH;
-  const key = sub ? null : (r.apiKey ?? (r.apiKeyEnv ? process.env[r.apiKeyEnv] : null) ?? null);
+  const codexSub = r.auth === CODEX_SUBSCRIPTION_AUTH;
+  const isSub = sub || codexSub;
+  const key = isSub ? null : (r.apiKey ?? (r.apiKeyEnv ? process.env[r.apiKeyEnv] : null) ?? null);
   return {
     alias,
     source: "remote",
-    ref: r.baseUrl,
+    ref: codexSub ? CODEX_API : r.baseUrl,
     file: null,             // nothing on disk - every `m.file` comparison must survive a null
     mmproj: null,
     name: r.label ?? alias,
@@ -53,16 +56,17 @@ function shape(alias, r) {
     nBlocks: 0,
     hasMTP: false,
     remote: {
-      baseUrl: String(r.baseUrl).replace(/\/+$/, ""),
+      baseUrl: codexSub ? CODEX_API : String(r.baseUrl).replace(/\/+$/, ""),
       model: r.model ?? alias,
       apiKey: key,
-      apiKeyEnv: sub ? null : (r.apiKeyEnv ?? null),
+      apiKeyEnv: isSub ? null : (r.apiKeyEnv ?? null),
       // "claude-subscription" means: authenticate as the signed-in Claude subscription, with the
-      // OAuth token read from disk at call time. Anything else authenticates with a key.
-      auth: sub ? SUBSCRIPTION_AUTH : null,
+      // OAuth token read from disk at call time. "codex-subscription" means the same for Codex.
+      // Anything else authenticates with a key.
+      auth: sub ? SUBSCRIPTION_AUTH : (codexSub ? CODEX_SUBSCRIPTION_AUTH : null),
       // "anthropic" is passthrough. "openai" routes the turn through the translator in openai.mjs,
       // which is what makes NVIDIA's build.nvidia.com catalog - Chat Completions only - usable here.
-      api: r.api === "openai" ? "openai" : "anthropic",
+      api: codexSub ? "responses" : r.api === "openai" ? "openai" : "anthropic",
       // Where the endpoint puts its completions verb. Only meaningful for the openai bridge, where
       // Claude Code's own `/v1/messages` path is meaningless upstream.
       path: r.path ?? null,
@@ -80,7 +84,7 @@ function shape(alias, r) {
       // token. Sending both satisfies every one of them and no provider rejects the spare header.
       // A subscription token is a bearer token and the API rejects it in `x-api-key`, so the
       // config does not get a say in how it is presented.
-      authStyle: sub ? "bearer" : (r.authStyle ?? "both"),
+      authStyle: isSub ? "bearer" : (r.authStyle ?? "both"),
       headers: r.headers ?? {},
       // A hosted model answers in seconds, so the local 8192-token output clamp - which exists
       // because a CPU-offloaded 27B would take an hour to fill a large one - is pointless here.
@@ -96,7 +100,7 @@ function shape(alias, r) {
 function valid(alias, r) {
   if (!r || typeof r !== "object") return "not an object";
   if (r.enabled === false) return "disabled";
-  if (!r.baseUrl || !/^https?:\/\//i.test(String(r.baseUrl))) return "baseUrl must be an http(s) URL";
+  if (r.auth !== CODEX_SUBSCRIPTION_AUTH && (!r.baseUrl || !/^https?:\/\//i.test(String(r.baseUrl)))) return "baseUrl must be an http(s) URL";
   if (!/^[a-z0-9][a-z0-9.\-]*$/.test(alias)) return "alias must be lowercase letters, digits, dots and dashes";
   return null;
 }
@@ -130,6 +134,7 @@ export function remoteKey(entry) {
   if (!r) return null;
   // The subscription token rotates hourly, so it is fetched per call and never held anywhere.
   if (r.auth === SUBSCRIPTION_AUTH) return subscriptionToken().token;
+  if (r.auth === CODEX_SUBSCRIPTION_AUTH) return codexSubscriptionToken().token;
   return r.apiKey ?? (r.apiKeyEnv ? process.env[r.apiKeyEnv] ?? null : null);
 }
 
@@ -138,6 +143,7 @@ export function remoteKeyProblem(entry) {
   const r = entry?.remote;
   if (!r) return null;
   if (r.auth === SUBSCRIPTION_AUTH) return subscriptionToken().reason;
+  if (r.auth === CODEX_SUBSCRIPTION_AUTH) return codexSubscriptionToken().reason;
   if (!remoteKey(entry) && r.apiKeyEnv) return `${r.apiKeyEnv} is not set`;
   return null;
 }
